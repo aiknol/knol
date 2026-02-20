@@ -34,7 +34,11 @@ pub async fn create_pool(database_url: &str, max_connections: u32) -> Result<PgP
 /// Run embedded migrations from the migrations/ directory.
 pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
     info!("Running database migrations...");
-    sqlx::migrate!("../../migrations").run(pool).await?;
+    let mut migrator = sqlx::migrate!("../../migrations");
+    // OSS and enterprise services can use different migration sets but the same
+    // database. Ignore already-applied versions that are not in this set.
+    migrator.set_ignore_missing(true);
+    migrator.run(pool).await?;
     info!("Migrations complete");
     Ok(())
 }

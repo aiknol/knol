@@ -4,7 +4,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use fred::prelude::*;
 use memory_common::db_config;
 use sqlx::PgPool;
-use tracing::warn;
+use tracing::{info, warn};
 
 pub struct AppState {
     pub db_pool: PgPool,
@@ -29,6 +29,8 @@ impl AppState {
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
 
         let db_pool = memory_db::create_pool(&database_url, 8).await?;
+        memory_db::run_migrations(&db_pool).await?;
+        info!("OSS migrations applied/verified");
         let redis_client = memory_cache::create_client(&redis_url).await?;
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
