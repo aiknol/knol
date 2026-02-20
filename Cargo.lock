@@ -1542,6 +1542,7 @@ dependencies = [
  "anyhow",
  "fred",
  "memory-common",
+ "rustls 0.23.36",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

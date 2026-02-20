@@ -5,8 +5,17 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::time::Duration;
 use tracing::{debug, warn};
 
+fn install_rustls_provider_if_needed() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // If another crate installed a provider first, install_default returns Err.
+        // That is safe to ignore; we only need one process-wide provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
 /// Create a Redis client and connect.
 pub async fn create_client(redis_url: &str) -> Result<RedisClient, fred::error::RedisError> {
+    install_rustls_provider_if_needed();
     let config = RedisConfig::from_url(redis_url)?;
     let client = Builder::from_config(config).build()?;
     client.init().await?;
