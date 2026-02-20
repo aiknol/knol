@@ -83,6 +83,9 @@ lazy_static = "1.4"
 # PII detection
 regex = "1"
 
+# Secret management
+secrecy = { version = "0.8", features = ["serde"] }
+
 # Internal crates
 memory-common = { path = "crates/memory-common" }
 memory-db = { path = "crates/memory-db" }

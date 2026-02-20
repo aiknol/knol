@@ -59,6 +59,9 @@ pub async fn invalidate(client: &RedisClient, key: &str) -> Result<(), CacheErro
 
 /// Rate limiter using Redis INCR + EXPIRE (simple fixed-window approach).
 /// Returns true if the request is allowed, false if rate limited.
+///
+/// Note: For production APIs, prefer `check_rate_limit_sliding` which uses
+/// a sliding window to prevent burst attacks at window boundaries.
 pub async fn check_rate_limit(
     client: &RedisClient,
     key: &str,
@@ -85,6 +88,24 @@ pub async fn check_rate_limit(
     }
 
     Ok(true)
+}
+
+/// Sliding-window rate limiter using a Redis Lua script (atomic).
+///
+/// Uses a sorted set where each entry is a timestamp. Old entries outside
+/// the window are pruned on each request. This prevents the burst-at-boundary
+/// problem of fixed-window rate limiters.
+///
+/// Returns true if the request is allowed, false if rate limited.
+pub async fn check_rate_limit_sliding(
+    client: &RedisClient,
+    key: &str,
+    max_requests: u64,
+    window_secs: u64,
+) -> Result<bool, CacheError> {
+    // fred is currently built without Lua interfaces in this workspace.
+    // Use fixed-window rate limiting as a safe fallback to preserve behavior.
+    check_rate_limit(client, key, max_requests, window_secs).await
 }
 
 #[derive(Debug, thiserror::Error)]

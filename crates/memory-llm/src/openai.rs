@@ -20,6 +20,7 @@ use crate::prompt::{
 };
 use crate::provider::{ExtractionOptions, LlmProvider};
 use crate::types::TokenUsage;
+use secrecy::{ExposeSecret, Secret};
 
 const DEFAULT_OPENAI_URL: &str = "https://api.openai.com/v1/chat/completions";
 const MAX_RETRIES: usize = 3;
@@ -29,7 +30,7 @@ const MAX_RETRY_DELAY_MS: u64 = 5000;
 /// OpenAI-compatible provider.
 pub struct OpenAiProvider {
     client: Arc<Client>,
-    api_key: String,
+    api_key: Secret<String>,
     model: String,
     api_url: String,
     token_usage: Arc<Mutex<TokenUsage>>,
@@ -39,7 +40,7 @@ impl Clone for OpenAiProvider {
     fn clone(&self) -> Self {
         Self {
             client: self.client.clone(),
-            api_key: self.api_key.clone(),
+            api_key: Secret::new(self.api_key.expose_secret().clone()),
             model: self.model.clone(),
             api_url: self.api_url.clone(),
             token_usage: self.token_usage.clone(),
@@ -57,7 +58,7 @@ impl OpenAiProvider {
     pub fn with_url(api_key: String, model: String, api_url: String) -> Self {
         Self {
             client: Arc::new(Client::new()),
-            api_key,
+            api_key: Secret::new(api_key),
             model,
             api_url,
             token_usage: Arc::new(Mutex::new(TokenUsage::default())),
@@ -118,7 +119,10 @@ impl OpenAiProvider {
         let response = self
             .client
             .post(&self.api_url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_key.expose_secret()),
+            )
             .header("Content-Type", "application/json")
             .json(&request)
             .send()
@@ -262,7 +266,10 @@ impl LlmProvider for OpenAiProvider {
         let response = self
             .client
             .post(&self.api_url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_key.expose_secret()),
+            )
             .header("Content-Type", "application/json")
             .json(&request)
             .send()

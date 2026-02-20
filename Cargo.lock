@@ -1621,6 +1621,7 @@ dependencies = [
  "memory-cache",
  "memory-common",
  "reqwest",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2",
@@ -2461,6 +2462,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "secrecy"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bd1c54ea06cfd2f6b63219704de0b9b4f72dcc2b8fdef820be6cd799780e91e"
+dependencies = [
+ "serde",
+ "zeroize",
+]
+
+[[package]]
 name = "security-framework"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2579,9 +2590,11 @@ dependencies = [
 name = "service-gateway"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "axum",
  "axum-extra",
+ "base64 0.22.1",
  "chrono",
  "fred",
  "hex",
@@ -2591,6 +2604,7 @@ dependencies = [
  "memory-common",
  "memory-db",
  "memory-graph",
+ "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",
@@ -2602,6 +2616,7 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

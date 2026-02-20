@@ -6,7 +6,7 @@ If you discover a security vulnerability in Knol, please report it responsibly. 
 
 ### How to Report
 
-Email **security@aiknol.com** with:
+Email **aiknolcontact@gmail.com** with:
 
 - A description of the vulnerability
 - Steps to reproduce the issue

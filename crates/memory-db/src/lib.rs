@@ -41,11 +41,21 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 
 /// Set the RLS tenant context on a connection.
 /// Must be called before any tenant-scoped query.
+///
+/// Note: PostgreSQL `SET LOCAL` does not support parameterized queries ($1),
+/// so we use `format!` with the UUID type which guarantees a safe string
+/// representation (hyphenated hex only, no SQL metacharacters).
 pub async fn set_tenant_context(
     conn: &mut sqlx::PgConnection,
     tenant_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id))
+    // Uuid::to_string() is guaranteed to produce only [0-9a-f-], safe for interpolation
+    let tid = tenant_id.to_string();
+    debug_assert!(
+        tid.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+        "UUID produced unexpected characters"
+    );
+    sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tid))
         .execute(&mut *conn)
         .await?;
     Ok(())
@@ -67,7 +77,12 @@ pub async fn begin_tenant_tx(
     tenant_id: Uuid,
 ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tenant_id))
+    let tid = tenant_id.to_string();
+    debug_assert!(
+        tid.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+        "UUID produced unexpected characters"
+    );
+    sqlx::query(&format!("SET LOCAL app.tenant_id = '{}'", tid))
         .execute(&mut *tx)
         .await?;
     Ok(tx)

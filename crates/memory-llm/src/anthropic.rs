@@ -17,6 +17,7 @@ use crate::prompt::{
 };
 use crate::provider::{ExtractionOptions, LlmProvider};
 use crate::types::TokenUsage;
+use secrecy::{ExposeSecret, Secret};
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -27,7 +28,7 @@ const MAX_RETRY_DELAY_MS: u64 = 5000;
 /// Anthropic Claude provider.
 pub struct AnthropicProvider {
     client: Arc<Client>,
-    api_key: String,
+    api_key: Secret<String>,
     model: String,
     token_usage: Arc<Mutex<TokenUsage>>,
 }
@@ -36,7 +37,7 @@ impl Clone for AnthropicProvider {
     fn clone(&self) -> Self {
         Self {
             client: self.client.clone(),
-            api_key: self.api_key.clone(),
+            api_key: Secret::new(self.api_key.expose_secret().clone()),
             model: self.model.clone(),
             token_usage: self.token_usage.clone(),
         }
@@ -47,7 +48,7 @@ impl AnthropicProvider {
     pub fn new(api_key: String, model: String) -> Self {
         Self {
             client: Arc::new(Client::new()),
-            api_key,
+            api_key: Secret::new(api_key),
             model,
             token_usage: Arc::new(Mutex::new(TokenUsage::default())),
         }
@@ -98,7 +99,7 @@ impl AnthropicProvider {
         let response = self
             .client
             .post(ANTHROPIC_API_URL)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.expose_secret())
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .json(&request)
@@ -253,7 +254,7 @@ impl LlmProvider for AnthropicProvider {
         let response = self
             .client
             .post(ANTHROPIC_API_URL)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.expose_secret())
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .json(&request)

@@ -1,8 +1,10 @@
 //! Application state for the gateway service.
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use fred::prelude::*;
 use memory_common::db_config;
 use sqlx::PgPool;
+use tracing::warn;
 
 pub struct AppState {
     pub db_pool: PgPool,
@@ -13,6 +15,9 @@ pub struct AppState {
     pub retrieve_service_url: String,
     pub admin_service_url: String,
     pub cors_origins: String,
+    /// Optional AES-256-GCM key for encrypting webhook secrets at rest.
+    /// Set via WEBHOOK_ENCRYPTION_KEY or ADMIN_ENCRYPTION_KEY env var.
+    /// If None, webhook secrets are stored in plaintext (with a warning).
     pub webhook_encryption_key: Option<[u8; 32]>,
 }
 
@@ -25,7 +30,12 @@ impl AppState {
 
         let db_pool = memory_db::create_pool(&database_url, 8).await?;
         let redis_client = memory_cache::create_client(&redis_url).await?;
-        let http_client = reqwest::Client::new();
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(std::time::Duration::from_secs(300))
+            .build()?;
 
         // Port: DB → env → default
         let port = db_config::load_u64(&db_pool, "services.gateway_port", "GATEWAY_PORT", 8080)
@@ -61,12 +71,8 @@ impl AppState {
         )
         .await;
 
-        let webhook_encryption_key = memory_common::webhook_crypto::load_encryption_key_from_env();
-        if webhook_encryption_key.is_some() {
-            tracing::info!("Webhook secret encryption: enabled");
-        } else {
-            tracing::warn!("Webhook secret encryption: disabled (set WEBHOOK_ENCRYPTION_KEY or ADMIN_ENCRYPTION_KEY)");
-        }
+        // Load optional webhook encryption key (try WEBHOOK_ENCRYPTION_KEY, fall back to ADMIN_ENCRYPTION_KEY)
+        let webhook_encryption_key = Self::load_webhook_encryption_key();
 
         Ok(Self {
             db_pool,
@@ -79,5 +85,34 @@ impl AppState {
             cors_origins,
             webhook_encryption_key,
         })
+    }
+
+    /// Try to load a 32-byte AES key from env vars.
+    /// Returns None (with warning) if not configured.
+    fn load_webhook_encryption_key() -> Option<[u8; 32]> {
+        let b64 = std::env::var("WEBHOOK_ENCRYPTION_KEY")
+            .or_else(|_| std::env::var("ADMIN_ENCRYPTION_KEY"))
+            .ok()?;
+
+        let bytes = match B64.decode(&b64) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("Webhook encryption key is not valid base64: {}. Webhook secrets will be stored in plaintext.", e);
+                return None;
+            }
+        };
+
+        if bytes.len() != 32 {
+            warn!(
+                "Webhook encryption key must be 32 bytes (got {}). Webhook secrets will be stored in plaintext.",
+                bytes.len()
+            );
+            return None;
+        }
+
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        tracing::info!("Webhook secret encryption enabled (AES-256-GCM)");
+        Some(key)
     }
 }

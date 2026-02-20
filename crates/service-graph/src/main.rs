@@ -936,7 +936,7 @@ async fn dispatch_webhooks(
                 "episode_id": episode_id.to_string(),
             }),
         );
-        fire_to_subscribers(wh_client, &webhooks, &event, wh_config).await;
+        fire_to_subscribers(db_pool, wh_client, &webhooks, &event, wh_config).await;
     }
 
     // Fire entity.created events
@@ -949,7 +949,7 @@ async fn dispatch_webhooks(
                 "name": name,
             }),
         );
-        fire_to_subscribers(wh_client, &webhooks, &event, wh_config).await;
+        fire_to_subscribers(db_pool, wh_client, &webhooks, &event, wh_config).await;
     }
 
     // Fire edge.created summary (one event for all edges)
@@ -962,7 +962,7 @@ async fn dispatch_webhooks(
                 "edge_count": edge_count,
             }),
         );
-        fire_to_subscribers(wh_client, &webhooks, &event, wh_config).await;
+        fire_to_subscribers(db_pool, wh_client, &webhooks, &event, wh_config).await;
     }
 
     // Fire conflict.detected events
@@ -976,7 +976,7 @@ async fn dispatch_webhooks(
                 "superseded_memory_ids": superseded_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
             }),
         );
-        fire_to_subscribers(wh_client, &webhooks, &event, wh_config).await;
+        fire_to_subscribers(db_pool, wh_client, &webhooks, &event, wh_config).await;
     }
 
     // Fire extraction.completed summary
@@ -991,11 +991,13 @@ async fn dispatch_webhooks(
             "conflicts_detected": conflict_count,
         }),
     );
-    fire_to_subscribers(wh_client, &webhooks, &event, wh_config).await;
+    fire_to_subscribers(db_pool, wh_client, &webhooks, &event, wh_config).await;
 }
 
 /// Fire a webhook event to all subscribers that match the event type.
+/// Persists delivery results to the webhook_deliveries table for audit.
 async fn fire_to_subscribers(
+    db_pool: &sqlx::PgPool,
     client: &reqwest::Client,
     webhooks: &[WebhookRegistration],
     event: &WebhookEvent,
@@ -1021,6 +1023,24 @@ async fn fire_to_subscribers(
                     wh.url,
                     delivery.error.as_deref().unwrap_or("unknown")
                 );
+            }
+
+            // Persist delivery result for audit trail (best-effort, don't fail on DB error)
+            if let Err(e) = sqlx::query(
+                r#"INSERT INTO webhook_deliveries (webhook_id, event_id, event_type, status_code, success, attempt, error)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+            )
+            .bind(delivery.webhook_id)
+            .bind(delivery.event_id)
+            .bind(event.event_type.as_str())
+            .bind(delivery.status_code.map(|s| s as i16))
+            .bind(delivery.success)
+            .bind(delivery.attempt as i32)
+            .bind(&delivery.error)
+            .execute(db_pool)
+            .await
+            {
+                warn!("Failed to persist webhook delivery record: {}", e);
             }
         }
     }

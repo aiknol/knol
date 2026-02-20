@@ -21,6 +21,6 @@ COPY --from=builder /app/target/release/service-graph /usr/local/bin/
 COPY migrations/ /app/migrations/
 
 ENV RUST_LOG=info
-EXPOSE 3000
+EXPOSE 8080 8081 8082 8083
 
 CMD ["service-gateway"]

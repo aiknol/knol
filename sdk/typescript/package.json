@@ -2,7 +2,7 @@
   "name": "@knol/sdk",
   "version": "0.1.0",
   "description": "Official TypeScript/JavaScript SDK for the Knol memory platform",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

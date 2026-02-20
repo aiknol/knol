@@ -4,7 +4,7 @@
 //! and routes requests to internal services.
 
 use axum::{
-    extract::{Json, Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Json, Path, Query, State},
     http::{header, HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -73,6 +73,7 @@ fn create_router(state: AppState) -> Router {
 
     let cors_raw = shared_state.cors_origins.trim();
     let cors = if cors_raw == "*" {
+        warn!("CORS configured to allow all origins (wildcard). This is not recommended for production.");
         cors_base.allow_origin(Any)
     } else {
         let origins: Vec<HeaderValue> = cors_raw
@@ -82,7 +83,8 @@ fn create_router(state: AppState) -> Router {
             .filter_map(|s| HeaderValue::from_str(s).ok())
             .collect();
         if origins.is_empty() {
-            cors_base.allow_origin(Any)
+            warn!("CORS_ORIGINS is empty or invalid — defaulting to same-origin only. Set CORS_ORIGINS explicitly or use '*' for development.");
+            cors_base
         } else {
             cors_base.allow_origin(origins)
         }
@@ -147,25 +149,100 @@ fn create_router(state: AppState) -> Router {
     Router::new()
         .merge(health_routes)
         .merge(api_routes)
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB max request body
+        .layer(middleware::from_fn(request_id_middleware))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(shared_state)
 }
 
+/// Middleware that adds a unique X-Request-Id header to each request and response
+/// for distributed tracing and log correlation.
+async fn request_id_middleware(request: Request<axum::body::Body>, next: Next) -> Response {
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    let mut response = next.run(request).await;
+    if let Ok(val) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-request-id", val);
+    }
+    response
+}
+
 // ── Middleware ──
+
+/// Extract client IP from X-Forwarded-For header (behind Caddy) or connection info.
+fn extract_client_ip(request: &Request<axum::body::Body>) -> String {
+    // Try X-Forwarded-For first (set by Caddy reverse proxy)
+    if let Some(xff) = request.headers().get("x-forwarded-for") {
+        if let Ok(s) = xff.to_str() {
+            if let Some(first_ip) = s.split(',').next() {
+                return first_ip.trim().to_string();
+            }
+        }
+    }
+    // Fall back to X-Real-IP
+    if let Some(real_ip) = request.headers().get("x-real-ip") {
+        if let Ok(s) = real_ip.to_str() {
+            return s.trim().to_string();
+        }
+    }
+    // Fall back to connection info
+    if let Some(addr) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
+        return addr.0.ip().to_string();
+    }
+    "unknown".to_string()
+}
 
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, MemoryError> {
+    let client_ip = extract_client_ip(&request);
+
+    // Check if this IP is already rate-limited due to auth failures
+    // Allow 20 failed auth attempts per 5-minute window per IP
+    let auth_fail_key = format!("auth_fail:{}", client_ip);
+    let auth_allowed = memory_cache::check_rate_limit(
+        &state.redis_client,
+        &auth_fail_key,
+        20,  // max failures
+        300, // 5-minute window
+    )
+    .await
+    .unwrap_or(true); // Allow on Redis errors to avoid locking out users
+
+    if !auth_allowed {
+        warn!("Auth rate limit exceeded for IP: {}", client_ip);
+        return Err(MemoryError::RateLimited);
+    }
+
     let auth_header = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| MemoryError::Auth("Missing Authorization header".into()))?;
+        .ok_or_else(|| {
+            // Track auth failure (fire and forget)
+            let redis = state.redis_client.clone();
+            let key = auth_fail_key.clone();
+            tokio::spawn(async move {
+                let _ = memory_cache::check_rate_limit(&redis, &key, 20, 300).await;
+            });
+            MemoryError::Auth("Missing Authorization header".into())
+        })?;
 
     let api_key = auth_header.strip_prefix("Bearer ").ok_or_else(|| {
+        // Track auth failure
+        let redis = state.redis_client.clone();
+        let key = auth_fail_key.clone();
+        tokio::spawn(async move {
+            let _ = memory_cache::check_rate_limit(&redis, &key, 20, 300).await;
+        });
         MemoryError::Auth("Invalid Authorization format. Use: Bearer <api_key>".into())
     })?;
 
@@ -222,7 +299,16 @@ async fn auth_middleware(
         .fetch_optional(&state.db_pool)
         .await
         .map_err(|e| MemoryError::Database(e.to_string()))?
-        .ok_or_else(|| MemoryError::Auth("Invalid API key".into()))?;
+        .ok_or_else(|| {
+            // Track auth failure for rate limiting
+            let redis = state.redis_client.clone();
+            let key = auth_fail_key.clone();
+            tokio::spawn(async move {
+                let _ = memory_cache::check_rate_limit(&redis, &key, 20, 300).await;
+            });
+            warn!("Invalid API key from IP: {}", client_ip);
+            MemoryError::Auth("Invalid API key".into())
+        })?;
 
         (tenant, TenantRole::Admin)
     };
@@ -270,10 +356,14 @@ async fn rate_limit_middleware(
         _ => (10, 60),
     };
 
-    let allowed =
-        memory_cache::check_rate_limit(&state.redis_client, &rate_key, max_rps, window_secs)
-            .await
-            .map_err(|e| MemoryError::Cache(e.to_string()))?;
+    let allowed = memory_cache::check_rate_limit_sliding(
+        &state.redis_client,
+        &rate_key,
+        max_rps,
+        window_secs,
+    )
+    .await
+    .map_err(|e| MemoryError::Cache(e.to_string()))?;
 
     if !allowed {
         return Err(MemoryError::RateLimited);
@@ -429,7 +519,9 @@ async fn get_memory(
     .map_err(|e| MemoryError::Database(e.to_string()))?
     .ok_or_else(|| MemoryError::NotFound(format!("Memory {} not found", id)))?;
 
-    Ok(Json(serde_json::to_value(row).unwrap()))
+    let value = serde_json::to_value(row)
+        .map_err(|e| MemoryError::Internal(format!("Serialization error: {}", e)))?;
+    Ok(Json(value))
 }
 
 async fn update_memory(
@@ -503,8 +595,9 @@ async fn list_entities(
 
     let json: Vec<serde_json::Value> = rows
         .iter()
-        .map(|r| serde_json::to_value(r).unwrap())
-        .collect();
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| MemoryError::Internal(format!("Serialization error: {}", e)))?;
     Ok(Json(json))
 }
 
@@ -526,7 +619,9 @@ async fn get_entity(
     .map_err(|e| MemoryError::Database(e.to_string()))?
     .ok_or_else(|| MemoryError::NotFound(format!("Entity {} not found", id)))?;
 
-    Ok(Json(serde_json::to_value(row).unwrap()))
+    let value = serde_json::to_value(row)
+        .map_err(|e| MemoryError::Internal(format!("Serialization error: {}", e)))?;
+    Ok(Json(value))
 }
 
 async fn get_entity_edges(
@@ -560,9 +655,20 @@ async fn get_entity_edges(
     .await
     .map_err(|e| MemoryError::Database(e.to_string()))?;
 
+    let outgoing_json: Vec<serde_json::Value> = outgoing
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| MemoryError::Internal(format!("Serialization error: {}", e)))?;
+    let incoming_json: Vec<serde_json::Value> = incoming
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| MemoryError::Internal(format!("Serialization error: {}", e)))?;
+
     Ok(Json(serde_json::json!({
-        "outgoing": outgoing.iter().map(|r| serde_json::to_value(r).unwrap()).collect::<Vec<_>>(),
-        "incoming": incoming.iter().map(|r| serde_json::to_value(r).unwrap()).collect::<Vec<_>>(),
+        "outgoing": outgoing_json,
+        "incoming": incoming_json,
     })))
 }
 
@@ -590,7 +696,9 @@ async fn get_tenant_info(
     .await
     .map_err(|e| MemoryError::Database(e.to_string()))?;
 
-    Ok(Json(serde_json::to_value(row).unwrap()))
+    let value = serde_json::to_value(row)
+        .map_err(|e| MemoryError::Internal(format!("Serialization error: {}", e)))?;
+    Ok(Json(value))
 }
 
 async fn list_audit_log(
@@ -802,6 +910,77 @@ async fn list_webhooks(
     Ok(Json(masked))
 }
 
+/// Maximum webhooks per tenant to prevent abuse.
+const MAX_WEBHOOKS_PER_TENANT: i64 = 50;
+
+/// Allowed webhook event type strings.
+const VALID_EVENT_TYPES: &[&str] = &[
+    "*",
+    "memory.created",
+    "memory.updated",
+    "memory.deleted",
+    "memory.conflict",
+    "memory.consolidated",
+    "memory.decayed",
+    "graph.entity_created",
+    "graph.edge_created",
+    "extraction.completed",
+];
+
+/// Validate a webhook URL to prevent SSRF attacks.
+fn validate_webhook_url(url: &str) -> Result<(), MemoryError> {
+    let parsed =
+        url::Url::parse(url).map_err(|_| MemoryError::Validation("Invalid webhook URL".into()))?;
+
+    // Only allow http/https
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(MemoryError::Validation(
+            "Webhook URL must use http or https".into(),
+        ));
+    }
+
+    // Must have a host
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| MemoryError::Validation("Webhook URL must have a host".into()))?;
+
+    // Block internal/private IPs and reserved hostnames
+    if host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host == "0.0.0.0"
+        || host == "169.254.169.254"
+        || host.ends_with(".internal")
+        || host.ends_with(".local")
+    {
+        return Err(MemoryError::Validation(
+            "Webhook URL cannot target internal or reserved addresses".into(),
+        ));
+    }
+
+    // Check for private IP ranges
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let is_private = match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_unspecified()
+                    || v4.octets()[0] == 169 && v4.octets()[1] == 254 // link-local
+            }
+            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        };
+        if is_private {
+            return Err(MemoryError::Validation(
+                "Webhook URL cannot target private or reserved IP ranges".into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 async fn create_webhook(
     State(state): State<Arc<AppState>>,
     ctx: axum::Extension<TenantContext>,
@@ -810,6 +989,10 @@ async fn create_webhook(
     let url = body["url"]
         .as_str()
         .ok_or_else(|| MemoryError::Validation("Missing 'url' field".into()))?;
+
+    // SSRF protection: validate webhook URL
+    validate_webhook_url(url)?;
+
     let raw_secret = body["secret"].as_str().map(|s| s.to_string());
     let description = body["description"].as_str().map(|s| s.to_string());
     let event_types: Vec<String> = body["event_types"]
@@ -820,6 +1003,33 @@ async fn create_webhook(
                 .collect()
         })
         .unwrap_or_else(|| vec!["*".to_string()]);
+
+    // Validate event types
+    for et in &event_types {
+        if !VALID_EVENT_TYPES.contains(&et.as_str()) {
+            return Err(MemoryError::Validation(format!(
+                "Unknown event type '{}'. Valid types: {}",
+                et,
+                VALID_EVENT_TYPES.join(", ")
+            )));
+        }
+    }
+
+    // Enforce per-tenant webhook quota
+    let webhook_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM webhooks WHERE tenant_id = $1 AND active = true",
+    )
+    .bind(ctx.tenant_id)
+    .fetch_one(&state.db_pool)
+    .await
+    .map_err(|e| MemoryError::Database(e.to_string()))?;
+
+    if webhook_count >= MAX_WEBHOOKS_PER_TENANT {
+        return Err(MemoryError::Validation(format!(
+            "Webhook quota exceeded (max {} per tenant)",
+            MAX_WEBHOOKS_PER_TENANT
+        )));
+    }
 
     // Encrypt the webhook secret at rest if an encryption key is configured
     let stored_secret = match (&raw_secret, &state.webhook_encryption_key) {

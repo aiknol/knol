@@ -29,6 +29,11 @@ fred.workspace = true
 sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
+# Webhook secret encryption at rest
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
 anyhow.workspace = true
 sqlx.workspace = true
 memory-graph.workspace = true
+url = "2"

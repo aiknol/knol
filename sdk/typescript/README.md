@@ -537,4 +537,4 @@ MIT
 
 - Documentation: https://docs.knol.ai
 - Issues: https://github.com/aiknol/knol-sdk-typescript/issues
-- Email: support@knol.ai
+- Email: aiknolcontact@gmail.com

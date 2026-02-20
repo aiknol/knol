@@ -20,6 +20,7 @@ use crate::prompt::{
 };
 use crate::provider::{ExtractionOptions, LlmProvider};
 use crate::types::TokenUsage;
+use secrecy::{ExposeSecret, Secret};
 
 const DEFAULT_GEMINI_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const MAX_RETRIES: usize = 3;
@@ -29,7 +30,7 @@ const MAX_RETRY_DELAY_MS: u64 = 5000;
 /// Google Gemini provider.
 pub struct GeminiProvider {
     client: Arc<Client>,
-    api_key: String,
+    api_key: Secret<String>,
     model: String,
     api_url: String,
     token_usage: Arc<Mutex<TokenUsage>>,
@@ -39,7 +40,7 @@ impl Clone for GeminiProvider {
     fn clone(&self) -> Self {
         Self {
             client: self.client.clone(),
-            api_key: self.api_key.clone(),
+            api_key: Secret::new(self.api_key.expose_secret().clone()),
             model: self.model.clone(),
             api_url: self.api_url.clone(),
             token_usage: self.token_usage.clone(),
@@ -57,7 +58,7 @@ impl GeminiProvider {
     pub fn with_url(api_key: String, model: String, api_url: String) -> Self {
         Self {
             client: Arc::new(Client::new()),
-            api_key,
+            api_key: Secret::new(api_key),
             model,
             api_url,
             token_usage: Arc::new(Mutex::new(TokenUsage::default())),
@@ -128,7 +129,7 @@ impl GeminiProvider {
             .client
             .post(&url)
             .header("Content-Type", "application/json")
-            .query(&[("key", &self.api_key)])
+            .query(&[("key", self.api_key.expose_secret())])
             .json(&request)
             .send()
             .await
@@ -278,7 +279,7 @@ impl LlmProvider for GeminiProvider {
             .client
             .post(&url)
             .header("Content-Type", "application/json")
-            .query(&[("key", &self.api_key)])
+            .query(&[("key", self.api_key.expose_secret())])
             .json(&request)
             .send()
             .await
