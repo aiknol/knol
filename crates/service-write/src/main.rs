@@ -19,6 +19,9 @@ use uuid::Uuid;
 struct AppState {
     db_pool: sqlx::PgPool,
     nats_js: async_nats::jetstream::Context,
+    max_content_len: usize,
+    /// Optional shared secret to verify internal service calls.
+    internal_service_secret: Option<String>,
 }
 
 #[tokio::main]
@@ -50,7 +53,22 @@ async fn main() -> anyhow::Result<()> {
     )
     .await as u16;
 
-    let state = Arc::new(AppState { db_pool, nats_js });
+    let max_content_len = memory_common::db_config::load_u64(
+        &db_pool,
+        "guardrails.max_input_content_len",
+        "MAX_INPUT_CONTENT_LEN",
+        50000,
+    )
+    .await as usize;
+
+    let internal_service_secret = std::env::var("INTERNAL_SERVICE_SECRET").ok();
+
+    let state = Arc::new(AppState {
+        db_pool,
+        nats_js,
+        max_content_len,
+        internal_service_secret,
+    });
 
     let app = Router::new()
         .route("/internal/ingest", post(ingest))
@@ -95,6 +113,35 @@ async fn shutdown_signal() {
     }
 }
 
+/// Verify optional internal service secret, then extract tenant ID.
+/// Uses constant-time comparison to prevent timing attacks.
+fn verify_internal_auth(
+    headers: &HeaderMap,
+    expected_secret: &Option<String>,
+) -> Result<(), memory_common::MemoryError> {
+    if let Some(secret) = expected_secret {
+        let provided = headers
+            .get("x-internal-secret")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        // Constant-time comparison to prevent timing attacks.
+        // First check lengths, then compare byte-by-byte with constant-time XOR.
+        let matches = provided.len() == secret.len()
+            && provided
+                .as_bytes()
+                .iter()
+                .zip(secret.as_bytes().iter())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0;
+        if !matches {
+            return Err(memory_common::MemoryError::Auth(
+                "Invalid or missing internal service secret".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn extract_tenant_id(headers: &HeaderMap) -> Result<Uuid, memory_common::MemoryError> {
     headers
         .get("x-tenant-id")
@@ -115,9 +162,24 @@ async fn ingest(
     headers: HeaderMap,
     Json(req): Json<MemoryWriteRequest>,
 ) -> Result<Json<MemoryWriteResponse>, memory_common::MemoryError> {
+    verify_internal_auth(&headers, &state.internal_service_secret)?;
     let tenant_id = extract_tenant_id(&headers)?;
     let user_id = req.user_id.or_else(|| extract_user_id(&headers));
     let role = req.role.as_deref().unwrap_or("user");
+
+    // Input validation
+    if req.content.is_empty() {
+        return Err(memory_common::MemoryError::Validation(
+            "Content cannot be empty".into(),
+        ));
+    }
+    if req.content.len() > state.max_content_len {
+        return Err(memory_common::MemoryError::Validation(format!(
+            "Content too long: {} bytes (max {})",
+            req.content.len(),
+            state.max_content_len
+        )));
+    }
 
     // Compute content hash for dedup
     let content_hash = {
@@ -182,13 +244,45 @@ async fn ingest(
     }))
 }
 
+/// Maximum items allowed in a single batch request to prevent resource exhaustion.
+const MAX_BATCH_SIZE: usize = 100;
+
 async fn ingest_batch(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(requests): Json<Vec<MemoryWriteRequest>>,
 ) -> Result<Json<Vec<MemoryWriteResponse>>, memory_common::MemoryError> {
+    verify_internal_auth(&headers, &state.internal_service_secret)?;
     let tenant_id = extract_tenant_id(&headers)?;
+
+    // Enforce batch size limit to prevent resource exhaustion
+    if requests.len() > MAX_BATCH_SIZE {
+        return Err(memory_common::MemoryError::Validation(format!(
+            "Batch too large: {} items (max {})",
+            requests.len(),
+            MAX_BATCH_SIZE
+        )));
+    }
+
     let mut responses = Vec::with_capacity(requests.len());
+
+    // Validate all items first
+    for (i, req) in requests.iter().enumerate() {
+        if req.content.is_empty() {
+            return Err(memory_common::MemoryError::Validation(format!(
+                "Item {}: content cannot be empty",
+                i
+            )));
+        }
+        if req.content.len() > state.max_content_len {
+            return Err(memory_common::MemoryError::Validation(format!(
+                "Item {}: content too long: {} bytes (max {})",
+                i,
+                req.content.len(),
+                state.max_content_len
+            )));
+        }
+    }
 
     for req in requests {
         let user_id = req.user_id.or_else(|| extract_user_id(&headers));

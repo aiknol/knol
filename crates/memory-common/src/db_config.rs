@@ -20,8 +20,22 @@ pub async fn load_string(pool: &PgPool, db_key: &str, env_name: &str, default: &
     load_str(pool, db_key, env_name, default).await
 }
 
+/// Check if a config key name looks like a secret (API key, password, token, etc.).
+fn is_sensitive_key(db_key: &str) -> bool {
+    let lower = db_key.to_lowercase();
+    lower.contains("key")
+        || lower.contains("secret")
+        || lower.contains("token")
+        || lower.contains("password")
+        || lower.contains("credential")
+}
+
 /// Load a string config: DB → env → default.
+/// Automatically redacts values of keys that look like secrets (containing
+/// "key", "secret", "token", "password") in debug logs.
 pub async fn load_str(pool: &PgPool, db_key: &str, env_name: &str, default: &str) -> String {
+    let sensitive = is_sensitive_key(db_key);
+
     // 1. Try database
     if let Ok(row) =
         sqlx::query_as::<_, ConfigRow>("SELECT value FROM system_config WHERE key = $1")
@@ -30,12 +44,20 @@ pub async fn load_str(pool: &PgPool, db_key: &str, env_name: &str, default: &str
             .await
     {
         if let Some(s) = row.value.as_str() {
-            debug!("Config '{}' loaded from DB: {}", db_key, s);
+            if sensitive {
+                debug!("Config '{}' loaded from DB: [REDACTED]", db_key);
+            } else {
+                debug!("Config '{}' loaded from DB: {}", db_key, s);
+            }
             return s.to_string();
         }
         let v = row.value.to_string();
         if v != "null" && !v.is_empty() {
-            debug!("Config '{}' loaded from DB: {}", db_key, v);
+            if sensitive {
+                debug!("Config '{}' loaded from DB: [REDACTED]", db_key);
+            } else {
+                debug!("Config '{}' loaded from DB: {}", db_key, v);
+            }
             return v;
         }
     }
@@ -49,7 +71,49 @@ pub async fn load_str(pool: &PgPool, db_key: &str, env_name: &str, default: &str
     }
 
     // 3. Compiled default
-    debug!("Config '{}' using default: {}", db_key, default);
+    if sensitive {
+        debug!("Config '{}' using default: [REDACTED]", db_key);
+    } else {
+        debug!("Config '{}' using default: {}", db_key, default);
+    }
+    default.to_string()
+}
+
+/// Load a secret string config: DB → env → default.
+/// Like `load_str` but NEVER logs the value, only the source.
+/// Use this for API keys, passwords, tokens, etc.
+pub async fn load_secret(pool: &PgPool, db_key: &str, env_name: &str, default: &str) -> String {
+    // 1. Try database
+    if let Ok(row) =
+        sqlx::query_as::<_, ConfigRow>("SELECT value FROM system_config WHERE key = $1")
+            .bind(db_key)
+            .fetch_one(pool)
+            .await
+    {
+        if let Some(s) = row.value.as_str() {
+            debug!("Config '{}' loaded from DB: [REDACTED]", db_key);
+            return s.to_string();
+        }
+        let v = row.value.to_string();
+        if v != "null" && !v.is_empty() {
+            debug!("Config '{}' loaded from DB: [REDACTED]", db_key);
+            return v;
+        }
+    }
+
+    // 2. Try env var
+    if let Ok(val) = std::env::var(env_name) {
+        if !val.is_empty() {
+            debug!(
+                "Config '{}' loaded from env {} [REDACTED]",
+                db_key, env_name
+            );
+            return val;
+        }
+    }
+
+    // 3. Compiled default
+    debug!("Config '{}' using default [REDACTED]", db_key);
     default.to_string()
 }
 
@@ -74,7 +138,7 @@ pub async fn load_u64(pool: &PgPool, db_key: &str, env_name: &str, default: u64)
 /// Load a boolean config: DB → env → default.
 pub async fn load_bool(pool: &PgPool, db_key: &str, env_name: &str, default: bool) -> bool {
     let s = load_str(pool, db_key, env_name, &default.to_string()).await;
-    matches!(s.as_str(), "true" | "1" | "yes")
+    matches!(s.to_lowercase().as_str(), "true" | "1" | "yes")
 }
 
 /// Load a string array config from the DB only (no env fallback).
@@ -94,6 +158,23 @@ pub async fn load_str_array(pool: &PgPool, db_key: &str) -> Option<Vec<String>> 
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect()
     })
+}
+
+/// Load a float array config from the DB only.
+///
+/// Expects the `value` column to be a JSON array of numbers, e.g. `[0.1, 0.2, 0.4, 1.0]`.
+/// Returns `None` if the key doesn't exist or isn't a valid array.
+pub async fn load_f64_array(pool: &PgPool, db_key: &str) -> Option<Vec<f64>> {
+    let row = sqlx::query_as::<_, ConfigRow>("SELECT value FROM system_config WHERE key = $1")
+        .bind(db_key)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()?;
+
+    row.value
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
 }
 
 #[cfg(test)]

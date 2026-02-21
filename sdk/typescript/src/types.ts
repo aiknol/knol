@@ -15,6 +15,8 @@ export interface TemporalFilter {
   start_date?: string;
   end_date?: string;
   recency_days?: number;
+  /** Simulate memory state at a specific point in time. ISO 8601 string. */
+  point_in_time?: string;
 }
 
 export type MemoryScope = 'private' | 'team' | 'organization' | 'public';
@@ -222,6 +224,20 @@ export interface CreateWebhookRequest {
   url: string;
   events: WebhookEvent[];
   active?: boolean;
+  /** Optional secret for HMAC signature verification. */
+  secret?: string;
+  description?: string;
+}
+
+export interface PolicyResponse {
+  id: string;
+  name?: string;
+  enabled: boolean;
+  [key: string]: unknown;
+}
+
+export interface CreatePolicyRequest {
+  [key: string]: unknown;
 }
 
 export interface ListWebhooksResponse {
@@ -259,6 +275,20 @@ export interface ListAuditLogResponse {
   entries: AuditLogEntry[];
   total: number;
   has_more: boolean;
+}
+
+// ============================================================================
+// Soft Delete / Restore Types
+// ============================================================================
+
+export interface DeleteMemoryOptions {
+  /** If true, permanently delete (requires Admin role). Default: soft delete. */
+  permanent?: boolean;
+}
+
+export interface RestoreMemoryResponse {
+  id: string;
+  status: 'restored';
 }
 
 // ============================================================================
@@ -344,4 +374,10 @@ export interface RequestInit extends globalThis.RequestInit {
 export interface PaginationOptions {
   limit?: number;
   offset?: number;
+}
+
+export interface AuditLogOptions {
+  limit?: number;
+  offset?: number;
+  memory_id?: string;
 }

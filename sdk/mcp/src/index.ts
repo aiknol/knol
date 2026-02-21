@@ -62,16 +62,26 @@ async function makeRequest(
     Authorization: `Bearer ${KNOL_API_KEY}`,
   };
 
+  // AbortController with 30s timeout to prevent hung requests
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30_000);
+
   const options: RequestInit = {
     method,
     headers,
+    signal: controller.signal,
   };
 
   if (body) {
     options.body = JSON.stringify(body);
   }
 
-  const response = await fetch(url, options);
+  let response: Response;
+  try {
+    response = await fetch(url, options);
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (!response.ok) {
     const error = await response.text();
@@ -241,6 +251,21 @@ const tools: Tool[] = [
   },
 ];
 
+/**
+ * Sanitize an ID parameter to prevent path traversal attacks.
+ * Only allows UUID-format strings (hex + hyphens) and rejects anything
+ * containing path separators, dots, or other unsafe characters.
+ */
+function sanitizeId(id: unknown, paramName: string): string {
+  const str = String(id || "");
+  // UUIDs: 8-4-4-4-12 hex characters with hyphens
+  const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+  if (!uuidRegex.test(str)) {
+    throw new Error(`Invalid ${paramName}: must be a valid UUID`);
+  }
+  return str;
+}
+
 // Tool handlers
 server.setRequestHandler("tools/list", async () => {
   return { tools };
@@ -255,7 +280,7 @@ server.setRequestHandler("tools/call", async (request) => {
     switch (name) {
       case "knol_remember": {
         const userId = (args as Record<string, unknown>).user_id || KNOL_USER_ID;
-        result = await makeRequest("/v1/memory", {
+        result = await makeRequest("POST", "/v1/memory", {
           content: (args as Record<string, unknown>).content,
           user_id: userId,
           session_id: (args as Record<string, unknown>).session_id,
@@ -266,7 +291,7 @@ server.setRequestHandler("tools/call", async (request) => {
 
       case "knol_search": {
         const userId = (args as Record<string, unknown>).user_id || KNOL_USER_ID;
-        result = await makeRequest("/v1/memory/search", {
+        result = await makeRequest("POST", "/v1/memory/search", {
           query: (args as Record<string, unknown>).query,
           user_id: userId,
           limit: (args as Record<string, unknown>).limit || 5,
@@ -277,13 +302,13 @@ server.setRequestHandler("tools/call", async (request) => {
       }
 
       case "knol_get": {
-        const memoryId = (args as Record<string, unknown>).memory_id;
-        result = await makeRequest(`/v1/memory/${memoryId}`, undefined);
+        const memoryId = sanitizeId((args as Record<string, unknown>).memory_id, "memory_id");
+        result = await makeRequest("GET", `/v1/memory/${memoryId}`);
         break;
       }
 
       case "knol_update": {
-        const memoryId = (args as Record<string, unknown>).memory_id;
+        const memoryId = sanitizeId((args as Record<string, unknown>).memory_id, "memory_id");
         const updateBody: Record<string, unknown> = {};
         if ((args as Record<string, unknown>).content) {
           updateBody.content = (args as Record<string, unknown>).content;
@@ -291,13 +316,13 @@ server.setRequestHandler("tools/call", async (request) => {
         if ((args as Record<string, unknown>).importance !== undefined) {
           updateBody.importance = (args as Record<string, unknown>).importance;
         }
-        result = await makeRequest(`/v1/memory/${memoryId}`, updateBody);
+        result = await makeRequest("PUT", `/v1/memory/${memoryId}`, updateBody);
         break;
       }
 
       case "knol_delete": {
-        const memoryId = (args as Record<string, unknown>).memory_id;
-        result = await makeRequest(`/v1/memory/${memoryId}`, undefined);
+        const memoryId = sanitizeId((args as Record<string, unknown>).memory_id, "memory_id");
+        result = await makeRequest("DELETE", `/v1/memory/${memoryId}`);
         break;
       }
 
@@ -317,15 +342,15 @@ server.setRequestHandler("tools/call", async (request) => {
         }
         const queryString = params.toString();
         const endpoint = queryString ? `/v1/graph/entities?${queryString}` : "/v1/graph/entities";
-        result = await makeRequest(endpoint, undefined);
+        result = await makeRequest("GET", endpoint);
         break;
       }
 
       case "knol_entity_neighbors": {
-        const entityId = (args as Record<string, unknown>).entity_id;
+        const entityId = sanitizeId((args as Record<string, unknown>).entity_id, "entity_id");
         const limit = (args as Record<string, unknown>).limit || 10;
         const endpoint = `/v1/graph/entities/${entityId}/neighbors?limit=${limit}`;
-        result = await makeRequest(endpoint, undefined);
+        result = await makeRequest("GET", endpoint);
         break;
       }
 
@@ -375,7 +400,7 @@ server.setRequestHandler("resources/read", async (request) => {
 
   if (uri === "knol://recent") {
     try {
-      const result = await makeRequest("/v1/memory/search", {
+      const result = await makeRequest("POST", "/v1/memory/search", {
         query: "*",
         user_id: KNOL_USER_ID,
         limit: 10,

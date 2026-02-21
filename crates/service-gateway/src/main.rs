@@ -90,10 +90,10 @@ fn create_router(state: AppState) -> Router {
         }
     };
 
-    // Public health + metrics (no auth required)
+    // Public health (no auth required)
     let health_routes = Router::new()
         .route("/health", get(health_check))
-        .route("/metrics", get(memory_common::metrics::metrics_handler));
+        .route("/metrics", get(metrics_with_auth));
 
     // ── Read-only routes (ReadOnly role and above) ──
     let read_routes = Router::new()
@@ -119,6 +119,7 @@ fn create_router(state: AppState) -> Router {
         .route("/v1/memory/batch", post(write_memory_batch))
         .route("/v1/memory/:id", put(update_memory))
         .route("/v1/memory/:id", delete(delete_memory))
+        .route("/v1/memory/:id/restore", post(restore_memory))
         .route("/v1/memory/import", post(import_memories))
         .layer(middleware::from_fn(require_developer));
 
@@ -149,15 +150,15 @@ fn create_router(state: AppState) -> Router {
     Router::new()
         .merge(health_routes)
         .merge(api_routes)
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB max request body
+        .layer(DefaultBodyLimit::max(shared_state.max_body_size))
         .layer(middleware::from_fn(request_id_middleware))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(shared_state)
 }
 
-/// Middleware that adds a unique X-Request-Id header to each request and response
-/// for distributed tracing and log correlation.
+/// Middleware that adds a unique X-Request-Id header and security headers
+/// to each request and response for distributed tracing and hardening.
 async fn request_id_middleware(request: Request<axum::body::Body>, next: Next) -> Response {
     let request_id = request
         .headers()
@@ -170,32 +171,136 @@ async fn request_id_middleware(request: Request<axum::body::Body>, next: Next) -
     if let Ok(val) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert("x-request-id", val);
     }
+    // Security headers
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+        .headers_mut()
+        .insert("x-frame-options", HeaderValue::from_static("DENY"));
+    response.headers_mut().insert(
+        "strict-transport-security",
+        HeaderValue::from_static("max-age=63072000; includeSubDomains; preload"),
+    );
+    response
+        .headers_mut()
+        .insert("cache-control", HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        "content-security-policy",
+        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+    );
+    response
+        .headers_mut()
+        .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    response.headers_mut().insert(
+        "permissions-policy",
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=(), payment=()"),
+    );
     response
 }
 
 // ── Middleware ──
 
 /// Extract client IP from X-Forwarded-For header (behind Caddy) or connection info.
-fn extract_client_ip(request: &Request<axum::body::Body>) -> String {
-    // Try X-Forwarded-For first (set by Caddy reverse proxy)
-    if let Some(xff) = request.headers().get("x-forwarded-for") {
-        if let Ok(s) = xff.to_str() {
-            if let Some(first_ip) = s.split(',').next() {
-                return first_ip.trim().to_string();
+///
+/// X-Forwarded-For is only trusted when the direct peer (socket address) is in
+/// the `trusted_proxies` set.  This prevents attackers from spoofing XFF to
+/// bypass rate limits.
+fn extract_client_ip(
+    request: &Request<axum::body::Body>,
+    trusted_proxies: &std::collections::HashSet<String>,
+) -> String {
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|addr| addr.0.ip().to_string());
+
+    let is_trusted_peer = peer_ip
+        .as_ref()
+        .map(|ip| trusted_proxies.contains(ip.as_str()))
+        .unwrap_or(false);
+
+    if is_trusted_peer {
+        // Only trust proxy headers when the connection comes from a known proxy
+        if let Some(xff) = request.headers().get("x-forwarded-for") {
+            if let Ok(s) = xff.to_str() {
+                if let Some(first_ip) = s.split(',').next() {
+                    return first_ip.trim().to_string();
+                }
+            }
+        }
+        if let Some(real_ip) = request.headers().get("x-real-ip") {
+            if let Ok(s) = real_ip.to_str() {
+                return s.trim().to_string();
             }
         }
     }
-    // Fall back to X-Real-IP
-    if let Some(real_ip) = request.headers().get("x-real-ip") {
-        if let Ok(s) = real_ip.to_str() {
-            return s.trim().to_string();
+
+    // Fall back to direct connection info
+    peer_ip.unwrap_or_else(|| "unknown".to_string())
+}
+
+/// In-memory auth failure rate limiter — fallback when Redis is unavailable.
+/// Ensures brute-force protection even without a Redis backend.
+async fn check_in_memory_auth_limit(
+    state: &Arc<AppState>,
+    ip: &str,
+    max_failures: u64,
+    window_secs: u64,
+) -> bool {
+    let mut tracker = state.auth_fail_tracker.lock().await;
+    let now = std::time::Instant::now();
+
+    if let Some(entry) = tracker.get_mut(ip) {
+        if now.duration_since(entry.window_start).as_secs() > window_secs {
+            // Window expired, reset
+            entry.count = 0;
+            entry.window_start = now;
+        }
+        entry.count < max_failures
+    } else {
+        true // No record = allowed
+    }
+}
+
+/// Record an auth failure in the in-memory tracker.
+async fn record_in_memory_auth_failure(state: &Arc<AppState>, ip: &str) {
+    let mut tracker = state.auth_fail_tracker.lock().await;
+    let now = std::time::Instant::now();
+
+    let entry = tracker
+        .entry(ip.to_string())
+        .or_insert_with(|| state::AuthFailEntry {
+            count: 0,
+            window_start: now,
+        });
+
+    if now.duration_since(entry.window_start).as_secs() > 300 {
+        entry.count = 1;
+        entry.window_start = now;
+    } else {
+        entry.count += 1;
+    }
+
+    // Periodic cleanup: remove expired entries when tracker gets large
+    if tracker.len() > 1000 {
+        tracker.retain(|_, e| now.duration_since(e.window_start).as_secs() <= 300);
+    }
+
+    // Hard cap: if still over limit after cleanup (active attack), evict oldest entries
+    if tracker.len() > 10_000 {
+        let mut entries: Vec<(String, std::time::Instant)> = tracker
+            .iter()
+            .map(|(k, v)| (k.clone(), v.window_start))
+            .collect();
+        entries.sort_by_key(|(_, ts)| *ts);
+        // Remove oldest half
+        let to_remove = entries.len() / 2;
+        for (key, _) in entries.into_iter().take(to_remove) {
+            tracker.remove(&key);
         }
     }
-    // Fall back to connection info
-    if let Some(addr) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
-        return addr.0.ip().to_string();
-    }
-    "unknown".to_string()
 }
 
 async fn auth_middleware(
@@ -203,19 +308,24 @@ async fn auth_middleware(
     mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, MemoryError> {
-    let client_ip = extract_client_ip(&request);
+    let client_ip = extract_client_ip(&request, &state.trusted_proxies);
 
-    // Check if this IP is already rate-limited due to auth failures
-    // Allow 20 failed auth attempts per 5-minute window per IP
+    // Check if this IP is already rate-limited due to auth failures.
+    // Allow 20 failed auth attempts per 5-minute window per IP.
+    // Uses Redis when available, falls back to in-memory tracker.
     let auth_fail_key = format!("auth_fail:{}", client_ip);
-    let auth_allowed = memory_cache::check_rate_limit(
-        &state.redis_client,
-        &auth_fail_key,
-        20,  // max failures
-        300, // 5-minute window
-    )
-    .await
-    .unwrap_or(true); // Allow on Redis errors to avoid locking out users
+    let auth_allowed = if let Some(ref redis) = state.redis_client {
+        match memory_cache::check_rate_limit(redis, &auth_fail_key, 20, 300).await {
+            Ok(allowed) => allowed,
+            Err(_) => {
+                // Redis error: fall back to in-memory tracker
+                check_in_memory_auth_limit(&state, &client_ip, 20, 300).await
+            }
+        }
+    } else {
+        // No Redis: use in-memory tracker to still enforce brute-force protection
+        check_in_memory_auth_limit(&state, &client_ip, 20, 300).await
+    };
 
     if !auth_allowed {
         warn!("Auth rate limit exceeded for IP: {}", client_ip);
@@ -226,23 +336,9 @@ async fn auth_middleware(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            // Track auth failure (fire and forget)
-            let redis = state.redis_client.clone();
-            let key = auth_fail_key.clone();
-            tokio::spawn(async move {
-                let _ = memory_cache::check_rate_limit(&redis, &key, 20, 300).await;
-            });
-            MemoryError::Auth("Missing Authorization header".into())
-        })?;
+        .ok_or_else(|| MemoryError::Auth("Missing Authorization header".into()))?;
 
     let api_key = auth_header.strip_prefix("Bearer ").ok_or_else(|| {
-        // Track auth failure
-        let redis = state.redis_client.clone();
-        let key = auth_fail_key.clone();
-        tokio::spawn(async move {
-            let _ = memory_cache::check_rate_limit(&redis, &key, 20, 300).await;
-        });
         MemoryError::Auth("Invalid Authorization format. Use: Bearer <api_key>".into())
     })?;
 
@@ -292,25 +388,26 @@ async fn auth_middleware(
         (tenant, role)
     } else {
         // Fallback: legacy lookup via tenants.api_key_hash (admin role by default)
-        let tenant = sqlx::query_as::<_, TenantRow>(
+        let tenant_opt = sqlx::query_as::<_, TenantRow>(
             "SELECT id, name, slug, plan, usage_ops_month, usage_limit FROM tenants WHERE api_key_hash = $1",
         )
         .bind(&key_hash)
         .fetch_optional(&state.db_pool)
         .await
-        .map_err(|e| MemoryError::Database(e.to_string()))?
-        .ok_or_else(|| {
-            // Track auth failure for rate limiting
-            let redis = state.redis_client.clone();
-            let key = auth_fail_key.clone();
-            tokio::spawn(async move {
-                let _ = memory_cache::check_rate_limit(&redis, &key, 20, 300).await;
-            });
-            warn!("Invalid API key from IP: {}", client_ip);
-            MemoryError::Auth("Invalid API key".into())
-        })?;
+        .map_err(|e| MemoryError::Database(e.to_string()))?;
 
-        (tenant, TenantRole::Admin)
+        match tenant_opt {
+            Some(tenant) => (tenant, TenantRole::Admin),
+            None => {
+                // Track auth failure in both Redis and in-memory
+                if let Some(ref redis) = state.redis_client {
+                    let _ = memory_cache::check_rate_limit(redis, &auth_fail_key, 20, 300).await;
+                }
+                record_in_memory_auth_failure(&state, &client_ip).await;
+                warn!("Invalid API key from IP: {}", client_ip);
+                return Err(MemoryError::Auth("Invalid API key".into()));
+            }
+        }
     };
 
     // Check plan limits
@@ -347,23 +444,28 @@ async fn rate_limit_middleware(
         .ok_or_else(|| MemoryError::Internal("Missing tenant context".into()))?;
 
     let rate_key = format!("rl:{}", ctx.tenant_id);
-    let (max_rps, window_secs) = match ctx.plan.as_str() {
-        "free" => (10u64, 60u64),
-        "developer" => (100, 60),
-        "pro" => (500, 60),
-        "team" => (2000, 60),
-        "enterprise" => (10000, 60),
-        _ => (10, 60),
-    };
+    let (max_rps, window_secs) = state
+        .rate_limit_tiers
+        .get(ctx.plan.as_str())
+        .copied()
+        .unwrap_or((10, 60));
 
-    let allowed = memory_cache::check_rate_limit_sliding(
-        &state.redis_client,
-        &rate_key,
-        max_rps,
-        window_secs,
-    )
-    .await
-    .map_err(|e| MemoryError::Cache(e.to_string()))?;
+    let allowed = if let Some(ref redis) = state.redis_client {
+        match memory_cache::check_rate_limit_sliding(redis, &rate_key, max_rps, window_secs).await {
+            Ok(allowed) => allowed,
+            Err(e) => {
+                warn!("Rate limit check failed: {}. Allowing request.", e);
+                state.skip_rate_limit_on_redis_failure
+            }
+        }
+    } else {
+        if !state.skip_rate_limit_on_redis_failure {
+            return Err(MemoryError::ServiceUnavailable(
+                "Rate limiting service unavailable".into(),
+            ));
+        }
+        true // No Redis = skip rate limiting
+    };
 
     if !allowed {
         return Err(MemoryError::RateLimited);
@@ -416,10 +518,60 @@ async fn require_role(
     Ok(next.run(request).await)
 }
 
+/// Attach internal service secret header to outgoing requests if configured.
+fn attach_internal_secret(
+    builder: reqwest::RequestBuilder,
+    state: &AppState,
+) -> reqwest::RequestBuilder {
+    if let Some(ref secret) = state.internal_service_secret {
+        builder.header("x-internal-secret", secret.as_str())
+    } else {
+        builder
+    }
+}
+
 // ── Route Handlers ──
 
 async fn health_check() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok", "service": "memory-gateway" }))
+}
+
+/// Metrics endpoint with optional bearer token protection.
+/// If METRICS_TOKEN is set, requires `Authorization: Bearer <token>`.
+/// This prevents exposing operational data (request rates, tenant counts, etc.)
+/// to unauthenticated parties.
+async fn metrics_with_auth(
+    State(state): State<Arc<AppState>>,
+    request: Request<axum::body::Body>,
+) -> Result<Response, MemoryError> {
+    if let Some(ref token) = state.metrics_token {
+        let provided = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "));
+
+        // Use constant-time comparison to prevent timing side-channel attacks.
+        let is_valid = provided
+            .map(|t| {
+                t.len() == token.len()
+                    && t.as_bytes()
+                        .iter()
+                        .zip(token.as_bytes().iter())
+                        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                        == 0
+            })
+            .unwrap_or(false);
+
+        if !is_valid {
+            return Err(MemoryError::Auth(
+                "Metrics endpoint requires authentication. Set METRICS_TOKEN env var.".into(),
+            ));
+        }
+    }
+    Ok(memory_common::metrics::metrics_handler()
+        .await
+        .into_response())
 }
 
 async fn write_memory(
@@ -427,7 +579,7 @@ async fn write_memory(
     ctx: axum::Extension<TenantContext>,
     Json(req): Json<MemoryWriteRequest>,
 ) -> Result<Json<MemoryWriteResponse>, MemoryError> {
-    let response: MemoryWriteResponse = state
+    let req_builder = state
         .http_client
         .post(format!("{}/internal/ingest", state.write_service_url))
         .header("x-tenant-id", ctx.tenant_id.to_string())
@@ -435,23 +587,34 @@ async fn write_memory(
             "x-user-id",
             ctx.user_id.map(|u| u.to_string()).unwrap_or_default(),
         )
-        .json(&req)
+        .json(&req);
+    let response: MemoryWriteResponse = attach_internal_secret(req_builder, &state)
         .send()
         .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?
+        .map_err(|e| MemoryError::DownstreamServiceError {
+            service: "write".into(),
+            message: e.to_string(),
+        })?
         .json()
         .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?;
+        .map_err(|e| MemoryError::DownstreamServiceError {
+            service: "write".into(),
+            message: e.to_string(),
+        })?;
 
-    // Increment usage counter (fire and forget)
+    // Atomic usage counter increment — prevents plan limit bypass under concurrency.
+    // The check in auth_middleware already validated the limit, but we still need
+    // an atomic increment to prevent TOCTOU races.
     let pool = state.db_pool.clone();
     let tid = ctx.tenant_id;
     tokio::spawn(async move {
-        let _ =
-            sqlx::query("UPDATE tenants SET usage_ops_month = usage_ops_month + 1 WHERE id = $1")
-                .bind(tid)
-                .execute(&pool)
-                .await;
+        let _ = sqlx::query(
+            "UPDATE tenants SET usage_ops_month = usage_ops_month + 1 \
+             WHERE id = $1 AND (usage_limit IS NULL OR usage_ops_month < usage_limit)",
+        )
+        .bind(tid)
+        .execute(&pool)
+        .await;
     });
 
     Ok(Json(response))
@@ -462,17 +625,41 @@ async fn write_memory_batch(
     ctx: axum::Extension<TenantContext>,
     Json(req): Json<Vec<MemoryWriteRequest>>,
 ) -> Result<Json<Vec<MemoryWriteResponse>>, MemoryError> {
-    let response: Vec<MemoryWriteResponse> = state
+    let req_builder = state
         .http_client
         .post(format!("{}/internal/ingest/batch", state.write_service_url))
         .header("x-tenant-id", ctx.tenant_id.to_string())
-        .json(&req)
+        .json(&req);
+    let response: Vec<MemoryWriteResponse> = attach_internal_secret(req_builder, &state)
         .send()
         .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?
+        .map_err(|e| MemoryError::DownstreamServiceError {
+            service: "write".into(),
+            message: e.to_string(),
+        })?
         .json()
         .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?;
+        .map_err(|e| MemoryError::DownstreamServiceError {
+            service: "write".into(),
+            message: e.to_string(),
+        })?;
+
+    // Atomic usage counter increment for batch — count each item in the batch.
+    let batch_size = response.len() as i32;
+    if batch_size > 0 {
+        let pool = state.db_pool.clone();
+        let tid = ctx.tenant_id;
+        tokio::spawn(async move {
+            let _ = sqlx::query(
+                "UPDATE tenants SET usage_ops_month = usage_ops_month + $2 \
+                 WHERE id = $1 AND (usage_limit IS NULL OR usage_ops_month + $2 <= usage_limit)",
+            )
+            .bind(tid)
+            .bind(batch_size)
+            .execute(&pool)
+            .await;
+        });
+    }
 
     Ok(Json(response))
 }
@@ -482,7 +669,7 @@ async fn search_memory(
     ctx: axum::Extension<TenantContext>,
     Json(req): Json<MemorySearchRequest>,
 ) -> Result<Json<MemorySearchResponse>, MemoryError> {
-    let response: MemorySearchResponse = state
+    let req_builder = state
         .http_client
         .post(format!("{}/internal/search", state.retrieve_service_url))
         .header("x-tenant-id", ctx.tenant_id.to_string())
@@ -490,13 +677,20 @@ async fn search_memory(
             "x-user-id",
             ctx.user_id.map(|u| u.to_string()).unwrap_or_default(),
         )
-        .json(&req)
+        .json(&req);
+    let response: MemorySearchResponse = attach_internal_secret(req_builder, &state)
         .send()
         .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?
+        .map_err(|e| MemoryError::DownstreamServiceError {
+            service: "retrieve".into(),
+            message: e.to_string(),
+        })?
         .json()
         .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?;
+        .map_err(|e| MemoryError::DownstreamServiceError {
+            service: "retrieve".into(),
+            message: e.to_string(),
+        })?;
 
     Ok(Json(response))
 }
@@ -540,10 +734,16 @@ async fn update_memory(
         .json(&body)
         .send()
         .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?
+        .map_err(|e| MemoryError::DownstreamServiceError {
+            service: "admin".into(),
+            message: e.to_string(),
+        })?
         .json()
         .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?;
+        .map_err(|e| MemoryError::DownstreamServiceError {
+            service: "admin".into(),
+            message: e.to_string(),
+        })?;
 
     Ok(Json(response))
 }
@@ -552,22 +752,84 @@ async fn delete_memory(
     State(state): State<Arc<AppState>>,
     ctx: axum::Extension<TenantContext>,
     Path(id): Path<Uuid>,
+    Query(params): Query<DeleteMemoryParams>,
 ) -> Result<StatusCode, MemoryError> {
-    let _: serde_json::Value = state
-        .http_client
-        .delete(format!(
-            "{}/internal/memory/{}",
-            state.admin_service_url, id
-        ))
-        .header("x-tenant-id", ctx.tenant_id.to_string())
-        .send()
+    if params.permanent.unwrap_or(false) {
+        // Permanent delete: requires Admin role, delegates to admin service
+        if !ctx.role.has_permission(TenantRole::Admin) {
+            return Err(MemoryError::Forbidden(
+                "Permanent delete requires Admin role".into(),
+            ));
+        }
+        let _: serde_json::Value = state
+            .http_client
+            .delete(format!(
+                "{}/internal/memory/{}",
+                state.admin_service_url, id
+            ))
+            .header("x-tenant-id", ctx.tenant_id.to_string())
+            .send()
+            .await
+            .map_err(|e| MemoryError::DownstreamServiceError {
+                service: "admin".into(),
+                message: e.to_string(),
+            })?
+            .json()
+            .await
+            .map_err(|e| MemoryError::DownstreamServiceError {
+                service: "admin".into(),
+                message: e.to_string(),
+            })?;
+    } else {
+        // Soft delete: mark as deleted with timestamp
+        let mut conn = memory_db::acquire_tenant_conn(&state.db_pool, ctx.tenant_id)
+            .await
+            .map_err(|e| MemoryError::Database(e.to_string()))?;
+
+        let rows_affected = sqlx::query(
+            "UPDATE memories SET status = 'deleted', deleted_at = now(), updated_at = now() WHERE id = $1 AND status = 'active'",
+        )
+        .bind(id)
+        .execute(conn.as_mut())
         .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?
-        .json()
-        .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?;
+        .map_err(|e| MemoryError::Database(e.to_string()))?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            return Err(MemoryError::NotFound(format!("Memory {} not found", id)));
+        }
+    }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn restore_memory(
+    State(state): State<Arc<AppState>>,
+    ctx: axum::Extension<TenantContext>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, MemoryError> {
+    let mut conn = memory_db::acquire_tenant_conn(&state.db_pool, ctx.tenant_id)
+        .await
+        .map_err(|e| MemoryError::Database(e.to_string()))?;
+
+    let restored = sqlx::query_scalar::<_, Uuid>(
+        "UPDATE memories SET status = 'active', deleted_at = NULL, updated_at = now() WHERE id = $1 AND status = 'deleted' RETURNING id",
+    )
+    .bind(id)
+    .fetch_optional(conn.as_mut())
+    .await
+    .map_err(|e| MemoryError::Database(e.to_string()))?;
+
+    match restored {
+        Some(restored_id) => Ok(Json(serde_json::json!({
+            "id": restored_id,
+            "status": "restored",
+        }))),
+        None => Err(MemoryError::NotFound(format!(
+            "No deleted memory {} found to restore",
+            id
+        ))),
+    }
 }
 
 async fn list_entities(
@@ -588,7 +850,7 @@ async fn list_entities(
         "#,
     )
     .bind(params.entity_type.as_deref())
-    .bind(params.limit.unwrap_or(50) as i64)
+    .bind(params.limit.unwrap_or(50).min(1000) as i64)
     .fetch_all(conn.as_mut())
     .await
     .map_err(|e| MemoryError::Database(e.to_string()))?;
@@ -713,10 +975,16 @@ async fn list_audit_log(
         .query(&params)
         .send()
         .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?
+        .map_err(|e| MemoryError::DownstreamServiceError {
+            service: "admin".into(),
+            message: e.to_string(),
+        })?
         .json()
         .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?;
+        .map_err(|e| MemoryError::DownstreamServiceError {
+            service: "admin".into(),
+            message: e.to_string(),
+        })?;
 
     Ok(Json(response))
 }
@@ -751,10 +1019,16 @@ async fn create_policy(
         .json(&body)
         .send()
         .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?
+        .map_err(|e| MemoryError::DownstreamServiceError {
+            service: "admin".into(),
+            message: e.to_string(),
+        })?
         .json()
         .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?;
+        .map_err(|e| MemoryError::DownstreamServiceError {
+            service: "admin".into(),
+            message: e.to_string(),
+        })?;
 
     Ok((StatusCode::CREATED, Json(response)))
 }
@@ -773,10 +1047,16 @@ async fn export_memories(
         .json(&req)
         .send()
         .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?
+        .map_err(|e| MemoryError::DownstreamServiceError {
+            service: "retrieve".into(),
+            message: e.to_string(),
+        })?
         .json()
         .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?;
+        .map_err(|e| MemoryError::DownstreamServiceError {
+            service: "retrieve".into(),
+            message: e.to_string(),
+        })?;
 
     Ok(Json(response))
 }
@@ -793,10 +1073,16 @@ async fn import_memories(
         .json(&req)
         .send()
         .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?
+        .map_err(|e| MemoryError::DownstreamServiceError {
+            service: "write".into(),
+            message: e.to_string(),
+        })?
         .json()
         .await
-        .map_err(|e| MemoryError::Internal(e.to_string()))?;
+        .map_err(|e| MemoryError::DownstreamServiceError {
+            service: "write".into(),
+            message: e.to_string(),
+        })?;
 
     Ok((StatusCode::CREATED, Json(response)))
 }
@@ -809,13 +1095,23 @@ async fn traverse_entity(
     Path(id): Path<Uuid>,
     Query(params): Query<TraverseParams>,
 ) -> Result<Json<serde_json::Value>, MemoryError> {
-    let depth = params.depth.unwrap_or(2).min(5);
-    let max_results = params.limit.unwrap_or(50) as i64;
+    let depth = params
+        .depth
+        .unwrap_or(2)
+        .min(state.graph_max_traversal_depth);
+    let max_results = (params.limit.unwrap_or(50) as i64).min(state.graph_max_traversal_results);
 
-    let results =
-        memory_graph::expand_nhop(&state.db_pool, ctx.tenant_id, id, depth, None, max_results)
-            .await
-            .map_err(|e| MemoryError::Database(e.to_string()))?;
+    let results = memory_graph::expand_nhop(
+        &state.db_pool,
+        ctx.tenant_id,
+        id,
+        depth,
+        None,
+        max_results,
+        Some(state.graph_max_traversal_depth),
+    )
+    .await
+    .map_err(|e| MemoryError::Database(e.to_string()))?;
 
     let entities: Vec<serde_json::Value> = results
         .iter()
@@ -836,11 +1132,18 @@ async fn find_graph_path(
     Path((from, to)): Path<(Uuid, Uuid)>,
     Query(params): Query<TraverseParams>,
 ) -> Result<Json<serde_json::Value>, MemoryError> {
-    let max_depth = params.depth.unwrap_or(5);
+    let max_depth = params.depth.unwrap_or(5).min(state.graph_max_path_depth);
 
-    let path = memory_graph::find_path(&state.db_pool, ctx.tenant_id, from, to, max_depth)
-        .await
-        .map_err(|e| MemoryError::Database(e.to_string()))?;
+    let path = memory_graph::find_path(
+        &state.db_pool,
+        ctx.tenant_id,
+        from,
+        to,
+        max_depth,
+        Some(state.graph_max_path_depth),
+    )
+    .await
+    .map_err(|e| MemoryError::Database(e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "from": from,
@@ -861,7 +1164,7 @@ async fn get_entity_neighbors(
         ctx.tenant_id,
         id,
         params.rel_type.as_deref(),
-        params.limit.unwrap_or(50) as i64,
+        params.limit.unwrap_or(50).min(1000) as i64,
     )
     .await
     .map_err(|e| MemoryError::Database(e.to_string()))?;
@@ -910,8 +1213,7 @@ async fn list_webhooks(
     Ok(Json(masked))
 }
 
-/// Maximum webhooks per tenant to prevent abuse.
-const MAX_WEBHOOKS_PER_TENANT: i64 = 50;
+// MAX_WEBHOOKS_PER_TENANT is now configurable via state.max_webhooks_per_tenant
 
 /// Allowed webhook event type strings.
 const VALID_EVENT_TYPES: &[&str] = &[
@@ -1024,10 +1326,10 @@ async fn create_webhook(
     .await
     .map_err(|e| MemoryError::Database(e.to_string()))?;
 
-    if webhook_count >= MAX_WEBHOOKS_PER_TENANT {
+    if webhook_count >= state.max_webhooks_per_tenant {
         return Err(MemoryError::Validation(format!(
             "Webhook quota exceeded (max {} per tenant)",
-            MAX_WEBHOOKS_PER_TENANT
+            state.max_webhooks_per_tenant
         )));
     }
 
@@ -1089,6 +1391,11 @@ async fn delete_webhook(
 }
 
 #[derive(Debug, Deserialize)]
+struct DeleteMemoryParams {
+    permanent: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TraverseParams {
     depth: Option<u32>,
     limit: Option<usize>,
@@ -1102,8 +1409,12 @@ struct NeighborParams {
 
 // ── Helper Types ──
 
+/// Hash an API key with a static application salt.
+/// The salt prevents rainbow-table attacks against the known `knol_live_` prefix.
 fn hash_api_key(key: &str) -> String {
+    const API_KEY_SALT: &[u8] = b"knol-memory-platform-v1";
     let mut hasher = Sha256::new();
+    hasher.update(API_KEY_SALT);
     hasher.update(key.as_bytes());
     hex::encode(hasher.finalize())
 }
@@ -1154,6 +1465,7 @@ struct MemoryRow {
     metadata: serde_json::Value,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+    deleted_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, sqlx::FromRow, Serialize)]
@@ -1243,9 +1555,14 @@ mod tests {
 
     #[test]
     fn test_hash_api_key_known_value() {
-        // SHA256("hello") is well-known
+        // SHA256(salt + "hello") — the salt is "knol-memory-platform-v1"
         let hash = hash_api_key("hello");
         assert_eq!(
+            hash,
+            "0254b0411757e197887de34540823b56a2984aad5b7576cd6b64ec8fa8dc73b0"
+        );
+        // Must NOT equal the unsalted SHA256("hello") — proves salt is applied
+        assert_ne!(
             hash,
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
@@ -1254,8 +1571,13 @@ mod tests {
     #[test]
     fn test_hash_api_key_empty_string() {
         let hash = hash_api_key("");
-        // SHA256 of empty string
+        // SHA256(salt + "") — the salt is "knol-memory-platform-v1"
         assert_eq!(
+            hash,
+            "575ca5507aec8906955fd4a7054186c285a2e33d09c038b08bc244ecb338e44c"
+        );
+        // Must NOT equal the unsalted SHA256("") — proves salt is applied
+        assert_ne!(
             hash,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
@@ -1263,25 +1585,25 @@ mod tests {
 
     #[test]
     fn test_rate_limit_tiers() {
-        // Verify rate limit mapping for each plan tier
-        let tiers: Vec<(&str, u64)> = vec![
+        // Verify rate limit mapping for each plan tier via HashMap lookup
+        let mut tiers = HashMap::new();
+        tiers.insert("free".to_string(), (10u64, 60u64));
+        tiers.insert("developer".to_string(), (100, 60));
+        tiers.insert("pro".to_string(), (500, 60));
+        tiers.insert("team".to_string(), (2000, 60));
+        tiers.insert("enterprise".to_string(), (10000, 60));
+
+        let test_cases: Vec<(&str, u64)> = vec![
             ("free", 10),
             ("developer", 100),
             ("pro", 500),
             ("team", 2000),
             ("enterprise", 10000),
-            ("unknown", 10),
+            ("unknown", 10), // fallback
         ];
 
-        for (plan, expected_rps) in tiers {
-            let (max_rps, window_secs) = match plan {
-                "free" => (10u64, 60u64),
-                "developer" => (100, 60),
-                "pro" => (500, 60),
-                "team" => (2000, 60),
-                "enterprise" => (10000, 60),
-                _ => (10, 60),
-            };
+        for (plan, expected_rps) in test_cases {
+            let (max_rps, window_secs) = tiers.get(plan).copied().unwrap_or((10, 60));
             assert_eq!(max_rps, expected_rps, "Failed for plan: {}", plan);
             assert_eq!(window_secs, 60, "Window should always be 60s");
         }

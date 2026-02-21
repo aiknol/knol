@@ -46,8 +46,13 @@ impl Clone for AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(api_key: String, model: String) -> Self {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
-            client: Arc::new(Client::new()),
+            client: Arc::new(client),
             api_key: Secret::new(api_key),
             model,
             token_usage: Arc::new(Mutex::new(TokenUsage::default())),
@@ -110,9 +115,14 @@ impl AnthropicProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            let truncated = if body.len() > 200 {
+                &body[..200]
+            } else {
+                &body
+            };
             return Err(LlmError::Api(format!(
                 "Anthropic HTTP {}: {}",
-                status, body
+                status, truncated
             )));
         }
 
@@ -265,9 +275,14 @@ impl LlmProvider for AnthropicProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            let truncated = if body.len() > 200 {
+                &body[..200]
+            } else {
+                &body
+            };
             return Err(LlmError::Api(format!(
                 "Anthropic verification HTTP {}: {}",
-                status, body
+                status, truncated
             )));
         }
 

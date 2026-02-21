@@ -384,20 +384,35 @@ pub mod middleware {
     /// ```
     pub async fn feature_gate(required: Feature, req: Request, next: Next) -> Response {
         // Extract FeatureFlags from request extensions if available
-        if let Some(flags) = req.extensions().get::<FeatureFlags>() {
-            if !flags.is_enabled(required) {
+        match req.extensions().get::<FeatureFlags>() {
+            Some(flags) => {
+                if !flags.is_enabled(required) {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        format!(
+                            "Feature '{}' requires {} tier or higher",
+                            required.name(),
+                            required.min_tier().name()
+                        ),
+                    )
+                        .into_response();
+                }
+            }
+            None => {
+                // If no flags in extensions, deny by default (fail-closed).
+                // This prevents feature bypass when middleware ordering issues
+                // or auth errors cause FeatureFlags to not be populated.
+                tracing::warn!(
+                    "FeatureFlags missing from request extensions — denying access to '{}'",
+                    required.name()
+                );
                 return (
                     StatusCode::FORBIDDEN,
-                    format!(
-                        "Feature '{}' requires {} tier or higher",
-                        required.name(),
-                        required.min_tier().name()
-                    ),
+                    format!("Feature '{}' is not available", required.name()),
                 )
                     .into_response();
             }
         }
-        // If no flags in extensions, allow (gateway should set them)
         next.run(req).await
     }
 }

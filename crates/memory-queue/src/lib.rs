@@ -8,13 +8,32 @@ pub const STREAM_NAME: &str = "MEMORY";
 pub const SUBJECT_WRITE: &str = "memory.write";
 pub const SUBJECT_EXTRACT: &str = "memory.extract";
 
+/// Redact password from a connection URL for safe logging.
+/// Replaces `://user:password@` with `://user:***@`.
+fn redact_url_password(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = &url[scheme_end + 3..];
+        if let Some(at_pos) = after_scheme.find('@') {
+            let userinfo = &after_scheme[..at_pos];
+            if let Some(colon_pos) = userinfo.find(':') {
+                let user = &userinfo[..colon_pos];
+                let host_part = &after_scheme[at_pos..];
+                return format!("{}://{}:***{}", &url[..scheme_end], user, host_part);
+            }
+        }
+    }
+    url.to_string()
+}
+
 /// Connect to NATS and return a JetStream context.
 pub async fn connect(nats_url: &str) -> Result<(async_nats::Client, Context), QueueError> {
     let client = async_nats::connect(nats_url)
         .await
         .map_err(QueueError::Connect)?;
     let jetstream = jetstream::new(client.clone());
-    info!("Connected to NATS at {}", nats_url);
+    // Redact password from URL before logging to prevent credential leakage.
+    let safe_url = redact_url_password(nats_url);
+    info!("Connected to NATS at {}", safe_url);
     Ok((client, jetstream))
 }
 

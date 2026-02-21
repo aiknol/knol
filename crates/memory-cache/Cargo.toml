@@ -13,3 +13,4 @@ tracing.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rand = "0.8"
