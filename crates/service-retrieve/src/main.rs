@@ -15,6 +15,8 @@
 use axum::{
     extract::{Json, State},
     http::HeaderMap,
+    middleware::Next,
+    response::Response,
     routing::{get, post},
     Router,
 };
@@ -31,6 +33,19 @@ struct AppState {
     db_pool: sqlx::PgPool,
     embedder: memory_llm::EmbeddingProvider,
     decay_config: memory_llm::DecayConfig,
+    /// Shared secret for verifying requests from the gateway.
+    internal_service_secret: Option<String>,
+    /// RRF fusion constant k.
+    rrf_k: f64,
+    /// Configurable BM25 text field weights [D, C, B, A].
+    bm25_weights: Option<[f32; 4]>,
+    /// Per-intent fusion weights: (vector, bm25, graph, scope).
+    intent_weights_preference: (f64, f64, f64, f64),
+    intent_weights_temporal: (f64, f64, f64, f64),
+    intent_weights_relational: (f64, f64, f64, f64),
+    intent_weights_general: (f64, f64, f64, f64),
+    /// Graph traversal max depth for search.
+    graph_max_depth: u32,
 }
 
 #[tokio::main]
@@ -85,15 +100,95 @@ async fn main() -> anyhow::Result<()> {
         decay_config.enabled, decay_config.function
     );
 
+    // Load configurable search weights from DB
+    let rrf_k =
+        memory_common::db_config::load_f64(&db_pool, "search.rrf_k", "SEARCH_RRF_K", 60.0).await;
+
+    let bm25_weights = memory_common::db_config::load_f64_array(&db_pool, "search.bm25_weights")
+        .await
+        .and_then(|arr| {
+            if arr.len() == 4 {
+                Some([arr[0] as f32, arr[1] as f32, arr[2] as f32, arr[3] as f32])
+            } else {
+                warn!("search.bm25_weights must have exactly 4 elements, ignoring");
+                None
+            }
+        });
+
+    // Per-intent fusion weights
+    let load_weight = |key: &str, default: f64| {
+        let pool = db_pool.clone();
+        let key = key.to_string();
+        async move { memory_common::db_config::load_f64(&pool, &key, "", default).await }
+    };
+
+    let intent_weights_preference = (
+        load_weight("search.vector_weight_preference", 1.0).await,
+        load_weight("search.bm25_weight_preference", 0.3).await,
+        load_weight("search.graph_weight_preference", 0.2).await,
+        load_weight("search.scope_weight_preference", 0.4).await,
+    );
+    let intent_weights_temporal = (
+        load_weight("search.vector_weight_temporal", 0.5).await,
+        load_weight("search.bm25_weight_temporal", 0.8).await,
+        load_weight("search.graph_weight_temporal", 0.7).await,
+        load_weight("search.scope_weight_temporal", 0.3).await,
+    );
+    let intent_weights_relational = (
+        load_weight("search.vector_weight_relational", 0.4).await,
+        load_weight("search.bm25_weight_relational", 0.2).await,
+        load_weight("search.graph_weight_relational", 1.0).await,
+        load_weight("search.scope_weight_relational", 0.3).await,
+    );
+    let intent_weights_general = (
+        load_weight("search.vector_weight_general", 0.7).await,
+        load_weight("search.bm25_weight_general", 0.6).await,
+        load_weight("search.graph_weight_general", 0.5).await,
+        load_weight("search.scope_weight_general", 0.4).await,
+    );
+
+    let graph_max_depth = memory_common::db_config::load_u64(
+        &db_pool,
+        "graph.max_traversal_depth",
+        "GRAPH_MAX_TRAVERSAL_DEPTH",
+        10,
+    )
+    .await as u32;
+
+    info!(
+        "Search config: rrf_k={}, bm25_weights={:?}, graph_max_depth={}",
+        rrf_k, bm25_weights, graph_max_depth
+    );
+
+    let internal_service_secret = std::env::var("INTERNAL_SERVICE_SECRET").ok();
+    if internal_service_secret.is_none() {
+        warn!("INTERNAL_SERVICE_SECRET not set — internal endpoints are unprotected");
+    }
+
     let state = Arc::new(AppState {
         db_pool,
         embedder,
         decay_config,
+        internal_service_secret,
+        rrf_k,
+        bm25_weights,
+        intent_weights_preference,
+        intent_weights_temporal,
+        intent_weights_relational,
+        intent_weights_general,
+        graph_max_depth,
     });
 
-    let app = Router::new()
+    let internal_routes = Router::new()
         .route("/internal/search", post(search))
         .route("/internal/export", post(export_memories))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            verify_internal_auth,
+        ));
+
+    let app = Router::new()
+        .merge(internal_routes)
         .route(
             "/health",
             get(|| async {
@@ -147,6 +242,38 @@ fn extract_user_id(headers: &HeaderMap) -> Option<Uuid> {
         .get("x-user-id")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| Uuid::parse_str(s).ok())
+}
+
+/// Verify that internal requests carry the correct shared secret.
+/// Uses constant-time comparison to prevent timing side-channel attacks.
+async fn verify_internal_auth(
+    State(state): State<Arc<AppState>>,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, memory_common::MemoryError> {
+    if let Some(ref secret) = state.internal_service_secret {
+        let provided = request
+            .headers()
+            .get("x-internal-secret")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let matches = provided.len() == secret.len()
+            && provided
+                .as_bytes()
+                .iter()
+                .zip(secret.as_bytes().iter())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0;
+
+        if !matches {
+            return Err(memory_common::MemoryError::Auth(
+                "Invalid internal service secret".into(),
+            ));
+        }
+    }
+
+    Ok(next.run(request).await)
 }
 
 /// Classify query intent to determine retrieval strategy.
@@ -220,21 +347,48 @@ async fn bm25_search(
     tenant_id: Uuid,
     query: &str,
     limit: i64,
+    weights: Option<[f32; 4]>,
 ) -> Result<Vec<BM25Result>, sqlx::Error> {
-    let results = sqlx::query_as::<_, (Uuid, f32)>(
-        "SELECT id, ts_rank_cd(search_vector, plainto_tsquery('english', $1)) as score
-         FROM memories
-         WHERE search_vector @@ plainto_tsquery('english', $1)
-           AND tenant_id = $2
-           AND status = 'active'
-         ORDER BY score DESC
-         LIMIT $3",
-    )
-    .bind(query)
-    .bind(tenant_id)
-    .bind(limit)
-    .fetch_all(db_pool)
-    .await?;
+    // Use parameterized weights to avoid format!() interpolation in SQL.
+    let results = if let Some(w) = weights {
+        sqlx::query_as::<_, (Uuid, f32)>(
+            r#"SELECT id, ts_rank_cd(
+                   ARRAY[$4, $5, $6, $7]::float4[],
+                   search_vector,
+                   plainto_tsquery('english', $1)
+               ) as score
+             FROM memories
+             WHERE search_vector @@ plainto_tsquery('english', $1)
+               AND tenant_id = $2
+               AND status = 'active'
+             ORDER BY score DESC
+             LIMIT $3"#,
+        )
+        .bind(query)
+        .bind(tenant_id)
+        .bind(limit)
+        .bind(w[0])
+        .bind(w[1])
+        .bind(w[2])
+        .bind(w[3])
+        .fetch_all(db_pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, (Uuid, f32)>(
+            "SELECT id, ts_rank_cd(search_vector, plainto_tsquery('english', $1)) as score
+             FROM memories
+             WHERE search_vector @@ plainto_tsquery('english', $1)
+               AND tenant_id = $2
+               AND status = 'active'
+             ORDER BY score DESC
+             LIMIT $3",
+        )
+        .bind(query)
+        .bind(tenant_id)
+        .bind(limit)
+        .fetch_all(db_pool)
+        .await?
+    };
 
     Ok(results
         .into_iter()
@@ -354,9 +508,15 @@ async fn search(
     let mut bm25_scores: HashMap<Uuid, f32> = HashMap::new();
 
     if matches!(intent, QueryIntent::General | QueryIntent::Temporal) {
-        let bm25_results = bm25_search(&state.db_pool, tenant_id, &req.query, limit * 2)
-            .await
-            .unwrap_or_default();
+        let bm25_results = bm25_search(
+            &state.db_pool,
+            tenant_id,
+            &req.query,
+            limit * 2,
+            state.bm25_weights,
+        )
+        .await
+        .unwrap_or_default();
 
         for result in bm25_results {
             bm25_ids.push(result.id);
@@ -414,6 +574,7 @@ async fn search(
                     graph_depth,
                     None,
                     50,
+                    Some(state.graph_max_depth),
                 )
                 .await
                 .map_err(|e| memory_common::MemoryError::Database(e.to_string()))?;
@@ -422,12 +583,12 @@ async fn search(
         }
     }
 
-    // Step 5: Intent-based RRF fusion
+    // Step 5: Intent-based RRF fusion (configurable via admin)
     let (vector_weight, bm25_weight, graph_weight, scope_weight) = match intent {
-        QueryIntent::Preference => (1.0, 0.3, 0.2, 0.4),
-        QueryIntent::Temporal => (0.5, 0.8, 0.7, 0.3),
-        QueryIntent::Relational => (0.4, 0.2, 1.0, 0.3),
-        QueryIntent::General => (0.7, 0.6, 0.5, 0.4),
+        QueryIntent::Preference => state.intent_weights_preference,
+        QueryIntent::Temporal => state.intent_weights_temporal,
+        QueryIntent::Relational => state.intent_weights_relational,
+        QueryIntent::General => state.intent_weights_general,
     };
 
     let fused = rrf_fuse(
@@ -440,7 +601,7 @@ async fn search(
                 scope_weight,
             ),
         ],
-        60.0,
+        state.rrf_k,
     );
 
     // Step 6: Fetch full memory records and apply decay scoring
@@ -576,7 +737,14 @@ async fn export_memories(
     let start = std::time::Instant::now();
     let tenant_id = extract_tenant_id(&headers)?;
 
-    let export_limit = if req.limit > 0 { req.limit } else { 100_000 };
+    // Cap export at 10,000 rows to prevent memory exhaustion.
+    // Users needing more should use pagination.
+    const MAX_EXPORT_LIMIT: i64 = 10_000;
+    let export_limit = if req.limit > 0 {
+        std::cmp::min(req.limit, MAX_EXPORT_LIMIT)
+    } else {
+        MAX_EXPORT_LIMIT
+    };
 
     // Export memories
     let memories = sqlx::query_as::<_, MemoryRow>(
@@ -677,6 +845,7 @@ fn hit_to_memory(hit: &VectorSearchHit) -> MemoryItem {
         metadata: hit.metadata.clone(),
         created_at: hit.created_at,
         updated_at: hit.updated_at,
+        deleted_at: None,
     }
 }
 
@@ -702,6 +871,7 @@ fn row_to_memory(row: &MemoryRow) -> MemoryItem {
         metadata: row.metadata.clone(),
         created_at: row.created_at,
         updated_at: row.updated_at,
+        deleted_at: row.deleted_at,
     }
 }
 
@@ -727,4 +897,5 @@ struct MemoryRow {
     metadata: serde_json::Value,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+    deleted_at: Option<chrono::DateTime<chrono::Utc>>,
 }

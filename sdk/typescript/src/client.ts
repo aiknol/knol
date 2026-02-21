@@ -7,6 +7,9 @@ import {
   KnolClientConfig,
   KnolError,
   Memory,
+  MemoryScope,
+  MemoryKind,
+  TemporalFilter,
   WriteMemoryRequest,
   UpdateMemoryRequest,
   SearchMemoryRequest,
@@ -24,12 +27,16 @@ import {
   CreateWebhookRequest,
   ListWebhooksResponse,
   TenantUsage,
-  AuditLogEntry,
   ListAuditLogResponse,
+  AuditLogOptions,
   ExportMemoriesRequest,
   ExportMemoriesResponse,
   ImportMemoriesRequest,
   ImportMemoriesResponse,
+  DeleteMemoryOptions,
+  RestoreMemoryResponse,
+  PolicyResponse,
+  CreatePolicyRequest,
   SearchQueryBuilder as ISearchQueryBuilder,
 } from './types.js';
 
@@ -50,13 +57,13 @@ class SearchQueryBuilder implements ISearchQueryBuilder {
     return this;
   }
 
-  scope(scope: string | string[]): SearchQueryBuilder {
-    this.request.scope = scope as any;
+  scope(scope: MemoryScope | MemoryScope[]): SearchQueryBuilder {
+    this.request.scope = scope;
     return this;
   }
 
-  kind(kind: string | string[]): SearchQueryBuilder {
-    this.request.kind = kind as any;
+  kind(kind: MemoryKind | MemoryKind[]): SearchQueryBuilder {
+    this.request.kind = kind;
     return this;
   }
 
@@ -70,7 +77,7 @@ class SearchQueryBuilder implements ISearchQueryBuilder {
     return this;
   }
 
-  temporalFilter(filter: any): SearchQueryBuilder {
+  temporalFilter(filter: TemporalFilter): SearchQueryBuilder {
     this.request.temporal_filter = filter;
     return this;
   }
@@ -193,10 +200,18 @@ export class KnolClient {
   }
 
   /**
-   * Delete a memory
+   * Delete a memory (soft delete by default, permanent with options)
    */
-  async deleteMemory(id: string): Promise<void> {
-    await this.delete(`/v1/memory/${this.encodeId(id)}`);
+  async deleteMemory(id: string, options?: DeleteMemoryOptions): Promise<void> {
+    const params = options?.permanent ? '?permanent=true' : '';
+    await this.delete(`/v1/memory/${this.encodeId(id)}${params}`);
+  }
+
+  /**
+   * Restore a soft-deleted memory
+   */
+  async restoreMemory(id: string): Promise<RestoreMemoryResponse> {
+    return this.post<RestoreMemoryResponse>(`/v1/memory/${this.encodeId(id)}/restore`, {});
   }
 
   /**
@@ -334,12 +349,58 @@ export class KnolClient {
   /**
    * List audit log entries
    */
-  async listAuditLog(limit = 100, offset = 0): Promise<ListAuditLogResponse> {
+  async listAuditLog(options?: AuditLogOptions): Promise<ListAuditLogResponse> {
     const params = new URLSearchParams();
-    params.append('limit', limit.toString());
-    params.append('offset', offset.toString());
+    params.append('limit', (options?.limit ?? 100).toString());
+    if (options?.offset) params.append('offset', options.offset.toString());
+    if (options?.memory_id) params.append('memory_id', options.memory_id);
 
     return this.get<ListAuditLogResponse>(`/v1/admin/audit?${params}`);
+  }
+
+  /**
+   * List retention/memory policies
+   */
+  async listPolicies(): Promise<PolicyResponse[]> {
+    return this.get<PolicyResponse[]>('/v1/admin/policies');
+  }
+
+  /**
+   * Create a memory policy
+   */
+  async createPolicy(policy: CreatePolicyRequest): Promise<PolicyResponse> {
+    return this.post<PolicyResponse>('/v1/admin/policies', policy);
+  }
+
+  /**
+   * Verify a webhook signature (HMAC-SHA256).
+   * Use this to validate incoming webhook payloads.
+   */
+  static async verifyWebhookSignature(
+    payload: string,
+    signature: string,
+    secret: string,
+  ): Promise<boolean> {
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+      'raw',
+      encoder.encode(secret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign'],
+    );
+    const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(payload));
+    const expected = Array.from(new Uint8Array(sig))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+    // Constant-time comparison to prevent timing attacks.
+    // XOR each byte and accumulate — avoids early-exit leaking prefix length.
+    if (expected.length !== signature.length) return false;
+    let diff = 0;
+    for (let i = 0; i < expected.length; i++) {
+      diff |= expected.charCodeAt(i) ^ signature.charCodeAt(i);
+    }
+    return diff === 0;
   }
 
   // ========================================================================
@@ -377,12 +438,25 @@ export class KnolClient {
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
 
-        // Don't retry on client errors (4xx)
-        if (error instanceof KnolError && error.statusCode >= 400 && error.statusCode < 500) {
-          throw error;
+        if (error instanceof KnolError) {
+          // Retry on 429 (rate limited) — respect Retry-After header if present
+          if (error.statusCode === 429) {
+            const retryAfter = error.details?.retry_after;
+            const delayMs = typeof retryAfter === 'number'
+              ? retryAfter * 1000
+              : this.retryDelayMs * Math.pow(2, attempt);
+            if (attempt < this.retryAttempts - 1) {
+              await this.delay(delayMs);
+            }
+            continue;
+          }
+          // Don't retry on other client errors (4xx)
+          if (error.statusCode >= 400 && error.statusCode < 500) {
+            throw error;
+          }
         }
 
-        // Wait before retrying
+        // Wait before retrying (5xx or network errors)
         if (attempt < this.retryAttempts - 1) {
           await this.delay(this.retryDelayMs * Math.pow(2, attempt));
         }

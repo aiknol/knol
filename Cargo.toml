@@ -46,7 +46,7 @@ sqlx = { version = "0.7", features = [
 ] }
 
 # Redis
-fred = { version = "9", features = ["enable-rustls"] }
+fred = { version = "9", features = ["enable-rustls", "i-scripts"] }
 
 # NATS
 async-nats = "0.35"

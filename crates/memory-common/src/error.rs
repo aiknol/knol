@@ -39,6 +39,12 @@ pub enum MemoryError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
+
+    #[error("{service} service error: {message}")]
+    DownstreamServiceError { service: String, message: String },
 }
 
 impl From<serde_json::Error> for MemoryError {
@@ -58,7 +64,25 @@ impl axum::response::IntoResponse for MemoryError {
             Self::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded".into()),
             Self::PlanLimitExceeded(msg) => (StatusCode::PAYMENT_REQUIRED, msg.clone()),
-            _ => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+            Self::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
+            Self::DownstreamServiceError { service, message } => {
+                // Log the real error with service details for debugging, but return
+                // a generic message to clients to avoid leaking internal architecture.
+                tracing::error!("Downstream {} service error: {}", service, message);
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "A downstream service error occurred".to_string(),
+                )
+            }
+            _ => {
+                // Log the real error for debugging, but return a generic message to clients
+                // to prevent leaking internal details (DB schema, query fragments, etc.).
+                tracing::error!("Internal error: {}", self);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "An internal error occurred".to_string(),
+                )
+            }
         };
         let body = serde_json::json!({ "error": message });
         (status, axum::Json(body)).into_response()
@@ -130,5 +154,47 @@ mod tests {
             MemoryError::Internal("internal".into()),
             MemoryError::Internal(_)
         ));
+        assert!(matches!(
+            MemoryError::ServiceUnavailable("unavailable".into()),
+            MemoryError::ServiceUnavailable(_)
+        ));
+        assert!(matches!(
+            MemoryError::DownstreamServiceError {
+                service: "write".into(),
+                message: "timeout".into()
+            },
+            MemoryError::DownstreamServiceError { .. }
+        ));
+    }
+
+    #[test]
+    fn test_service_unavailable_response() {
+        use axum::response::IntoResponse;
+        let err = MemoryError::ServiceUnavailable("Redis down".into());
+        let response = err.into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn test_downstream_service_error_response() {
+        use axum::response::IntoResponse;
+        let err = MemoryError::DownstreamServiceError {
+            service: "write".into(),
+            message: "connection refused".into(),
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_downstream_service_error_display() {
+        let err = MemoryError::DownstreamServiceError {
+            service: "retrieve".into(),
+            message: "timeout".into(),
+        };
+        assert_eq!(err.to_string(), "retrieve service error: timeout");
     }
 }

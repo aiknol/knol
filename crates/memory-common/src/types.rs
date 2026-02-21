@@ -160,6 +160,8 @@ pub struct MemoryItem {
     pub metadata: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,7 +294,7 @@ pub struct TenantContext {
 }
 
 fn default_tenant_role() -> TenantRole {
-    TenantRole::Admin
+    TenantRole::ReadOnly
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -842,10 +844,10 @@ mod tests {
 
     #[test]
     fn test_tenant_context_default_role() {
-        // When deserializing without role field, should default to Admin (backward compat)
+        // When deserializing without role field, should default to ReadOnly (least privilege)
         let json =
             r#"{"tenant_id":"550e8400-e29b-41d4-a716-446655440000","user_id":null,"plan":"free"}"#;
         let ctx: TenantContext = serde_json::from_str(json).unwrap();
-        assert_eq!(ctx.role, TenantRole::Admin);
+        assert_eq!(ctx.role, TenantRole::ReadOnly);
     }
 }

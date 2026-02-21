@@ -34,7 +34,6 @@ CREATE TABLE IF NOT EXISTS tenants (
 
 -- RLS on tenants
 ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS tenant_self_access ON tenants;
 CREATE POLICY tenant_self_access ON tenants
   USING (id = current_setting('app.tenant_id', true)::uuid);
 
@@ -63,7 +62,6 @@ CREATE INDEX IF NOT EXISTS idx_episodes_time ON episodes(tenant_id, event_time D
 CREATE INDEX IF NOT EXISTS idx_episodes_hash ON episodes(tenant_id, content_hash);
 
 ALTER TABLE episodes ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS tenant_isolation_episodes ON episodes;
 CREATE POLICY tenant_isolation_episodes ON episodes
   USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
 
@@ -108,7 +106,6 @@ CREATE INDEX IF NOT EXISTS idx_memories_metadata ON memories USING GIN(metadata)
 CREATE INDEX IF NOT EXISTS idx_memories_fts ON memories USING GIN(to_tsvector('english', content));
 
 ALTER TABLE memories ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS tenant_isolation_memories ON memories;
 CREATE POLICY tenant_isolation_memories ON memories
   USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
 
@@ -134,7 +131,6 @@ CREATE INDEX IF NOT EXISTS idx_vectors_tenant ON memory_vectors(tenant_id, statu
 CREATE INDEX IF NOT EXISTS idx_vectors_dedup ON memory_vectors(tenant_id, content_hash);
 
 ALTER TABLE memory_vectors ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS tenant_isolation_vectors ON memory_vectors;
 CREATE POLICY tenant_isolation_vectors ON memory_vectors
   USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
 
@@ -167,7 +163,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_dedup ON entities(tenant_id, name
 CREATE INDEX IF NOT EXISTS idx_entities_fts ON entities USING GIN(to_tsvector('english', name || ' ' || COALESCE(summary, '')));
 
 ALTER TABLE entities ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS tenant_isolation_entities ON entities;
 CREATE POLICY tenant_isolation_entities ON entities
   USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
 
@@ -193,7 +188,6 @@ CREATE INDEX IF NOT EXISTS idx_edges_rel ON edges(tenant_id, rel_type);
 CREATE INDEX IF NOT EXISTS idx_edges_temporal ON edges(tenant_id, valid_from, valid_to);
 
 ALTER TABLE edges ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS tenant_isolation_edges ON edges;
 CREATE POLICY tenant_isolation_edges ON edges
   USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
 
@@ -215,7 +209,6 @@ CREATE TABLE IF NOT EXISTS working_memory (
 );
 
 ALTER TABLE working_memory ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS tenant_isolation_working ON working_memory;
 CREATE POLICY tenant_isolation_working ON working_memory
   USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
 
@@ -241,8 +234,8 @@ CREATE INDEX IF NOT EXISTS idx_procs_tenant ON procedural_memories(tenant_id, st
 CREATE INDEX IF NOT EXISTS idx_procs_embedding ON procedural_memories USING hnsw (embedding vector_cosine_ops);
 
 ALTER TABLE procedural_memories ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS tenant_isolation_procs ON procedural_memories;
 CREATE POLICY tenant_isolation_procs ON procedural_memories
   USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
 
 -- <<< END 005_working_procedural.sql
+

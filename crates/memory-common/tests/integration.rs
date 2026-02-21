@@ -115,6 +115,7 @@ fn test_full_write_search_roundtrip_types() {
                 metadata: serde_json::json!({}),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                deleted_at: None,
             },
             score: 0.92,
             vector_score: Some(0.88),

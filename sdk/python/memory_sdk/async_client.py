@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import httpx
 from typing import Any, Optional
 from uuid import UUID
 from datetime import datetime
+
+from .client import _validate_id
 
 
 class AsyncMemoryClient:
@@ -208,6 +211,7 @@ class AsyncMemoryClient:
         Returns:
             Full memory object.
         """
+        _validate_id(memory_id, "memory_id")
         response = await self._client.get(f"/v1/memory/{memory_id}")
         response.raise_for_status()
         return response.json()
@@ -231,6 +235,7 @@ class AsyncMemoryClient:
         Returns:
             Updated memory confirmation.
         """
+        _validate_id(memory_id, "memory_id")
         payload: dict[str, Any] = {}
         if content is not None:
             payload["content"] = content
@@ -243,14 +248,34 @@ class AsyncMemoryClient:
         response.raise_for_status()
         return response.json()
 
-    async def delete(self, memory_id: str) -> None:
-        """Delete a memory (soft delete).
+    async def delete(self, memory_id: str, *, permanent: bool = False) -> None:
+        """Delete a memory.
 
         Args:
             memory_id: UUID of the memory to delete.
+            permanent: If True, permanently delete (requires Admin role).
+                       If False (default), soft delete with ability to restore.
         """
-        response = await self._client.delete(f"/v1/memory/{memory_id}")
+        _validate_id(memory_id, "memory_id")
+        params = {}
+        if permanent:
+            params["permanent"] = "true"
+        response = await self._client.delete(f"/v1/memory/{memory_id}", params=params)
         response.raise_for_status()
+
+    async def restore(self, memory_id: str) -> dict:
+        """Restore a soft-deleted memory.
+
+        Args:
+            memory_id: UUID of the memory to restore.
+
+        Returns:
+            dict with id and status.
+        """
+        _validate_id(memory_id, "memory_id")
+        response = await self._client.post(f"/v1/memory/{memory_id}/restore")
+        response.raise_for_status()
+        return response.json()
 
     async def export_memories(
         self,
@@ -328,18 +353,21 @@ class AsyncMemoryClient:
 
     async def get_entity(self, entity_id: str) -> dict:
         """Get a specific entity by ID."""
+        _validate_id(entity_id, "entity_id")
         response = await self._client.get(f"/v1/graph/entities/{entity_id}")
         response.raise_for_status()
         return response.json()
 
     async def get_entity_edges(self, entity_id: str) -> dict:
         """Get all edges (relationships) for an entity."""
+        _validate_id(entity_id, "entity_id")
         response = await self._client.get(f"/v1/graph/entities/{entity_id}/edges")
         response.raise_for_status()
         return response.json()
 
     async def expand_entity(self, entity_id: str) -> dict:
         """Get 2-hop graph expansion from an entity."""
+        _validate_id(entity_id, "entity_id")
         response = await self._client.get(f"/v1/graph/entities/{entity_id}/expand")
         response.raise_for_status()
         return response.json()
@@ -361,6 +389,7 @@ class AsyncMemoryClient:
         Returns:
             dict with traversal result tree structure.
         """
+        _validate_id(entity_id, "entity_id")
         params: dict[str, Any] = {"depth": depth, "limit": limit}
         response = await self._client.get(
             f"/v1/graph/entities/{entity_id}/traverse", params=params
@@ -385,6 +414,8 @@ class AsyncMemoryClient:
         Returns:
             dict with path, length, and intermediate entities.
         """
+        _validate_id(from_id, "from_id")
+        _validate_id(to_id, "to_id")
         params: dict[str, Any] = {"max_depth": max_depth}
         response = await self._client.get(
             f"/v1/graph/path/{from_id}/{to_id}", params=params
@@ -409,6 +440,7 @@ class AsyncMemoryClient:
         Returns:
             dict with neighbors and their relationships.
         """
+        _validate_id(entity_id, "entity_id")
         params: dict[str, Any] = {"limit": limit}
         if rel_type:
             params["rel_type"] = rel_type
@@ -462,6 +494,7 @@ class AsyncMemoryClient:
         Args:
             webhook_id: ID of the webhook to delete.
         """
+        _validate_id(webhook_id, "webhook_id")
         response = await self._client.delete(f"/v1/webhooks/{webhook_id}")
         response.raise_for_status()
 
@@ -487,3 +520,53 @@ class AsyncMemoryClient:
         response = await self._client.get("/v1/admin/audit", params=params)
         response.raise_for_status()
         return response.json()
+
+    async def list_policies(self) -> list[dict]:
+        """List retention/memory policies.
+
+        Returns:
+            List of active policy objects.
+        """
+        response = await self._client.get("/v1/admin/policies")
+        response.raise_for_status()
+        return response.json()
+
+    async def create_policy(self, policy: dict[str, Any]) -> dict:
+        """Create a memory policy.
+
+        Args:
+            policy: Policy definition.
+
+        Returns:
+            Created policy object.
+        """
+        response = await self._client.post("/v1/admin/policies", json=policy)
+        response.raise_for_status()
+        return response.json()
+
+    # ── Webhook Signature Verification ──
+
+    @staticmethod
+    def verify_webhook_signature(
+        payload: str,
+        signature: str,
+        secret: str,
+    ) -> bool:
+        """Verify a webhook HMAC-SHA256 signature.
+
+        Args:
+            payload: Raw request body string.
+            signature: Hex-encoded HMAC signature from X-Webhook-Signature header.
+            secret: Webhook secret used when creating the webhook.
+
+        Returns:
+            True if the signature is valid.
+        """
+        import hmac
+        import hashlib
+        expected = hmac.new(
+            secret.encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(expected, signature)

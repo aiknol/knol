@@ -5,6 +5,7 @@
 //! redaction policies.
 
 use regex::Regex;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -90,8 +91,10 @@ pub struct RedactionResult {
     pub redactions: Vec<RedactionInfo>,
 }
 
-/// Information about a single redaction
-#[derive(Debug, Clone)]
+/// Information about a single redaction.
+///
+/// Custom Debug impl hides `original_text` to prevent PII leaking into logs.
+#[derive(Clone)]
 pub struct RedactionInfo {
     /// Type of PII that was redacted
     pub pii_type: PiiType,
@@ -99,6 +102,16 @@ pub struct RedactionInfo {
     pub original_text: String,
     /// Policy applied
     pub policy: PiiPolicy,
+}
+
+impl std::fmt::Debug for RedactionInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedactionInfo")
+            .field("pii_type", &self.pii_type)
+            .field("original_text", &"[REDACTED]")
+            .field("policy", &self.policy)
+            .finish()
+    }
 }
 
 /// PII Detector with configurable policies
@@ -230,12 +243,16 @@ impl PiiDetector {
                     masked
                 }
                 PiiPolicy::Hash => {
-                    // Simple hash using length and first/last chars for readability
-                    let hash = format!(
-                        "#{:08x}",
-                        pii_match.text.len() as u32 ^ pii_match.text.as_bytes()[0] as u32
-                    );
-                    hash
+                    // Cryptographic SHA-256 hash — irreversible, safe for PII
+                    let mut hasher = Sha256::new();
+                    hasher.update(pii_match.text.as_bytes());
+                    let digest = hasher.finalize();
+                    // Use first 8 bytes (16 hex chars) for readability while staying secure
+                    format!(
+                        "[HASHED:{}:{}]",
+                        pii_match.pii_type.as_str(),
+                        hex::encode(&digest[..8])
+                    )
                 }
                 PiiPolicy::Allow => pii_match.text.clone(),
             };
@@ -464,9 +481,12 @@ mod tests {
         let text = "Contact: john@example.com";
         let result = detector.redact(text);
 
-        // Email should be hashed
+        // Email should be hashed with SHA-256
         assert!(!result.text.contains("john@example.com"));
-        assert!(result.text.contains("#"));
+        assert!(result.text.contains("[HASHED:Email:"));
+        // Verify determinism: same input produces same hash
+        let result2 = detector.redact(text);
+        assert_eq!(result.text, result2.text);
     }
 
     #[test]

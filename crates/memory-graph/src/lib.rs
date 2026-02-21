@@ -199,9 +199,10 @@ pub async fn get_edges_to(
 /// and improves on the fixed 2-hop limitation.
 ///
 /// # Arguments
-/// * `max_depth` — Maximum number of hops (1-5). Clamped for safety.
+/// * `max_depth` — Maximum number of hops. Clamped to [1, config_max_depth].
 /// * `rel_types` — Optional filter: only traverse edges of these relationship types.
 /// * `max_results` — Maximum number of entity IDs to return.
+/// * `config_max_depth` — Configurable ceiling for depth (default 5 if None).
 pub async fn expand_nhop(
     pool: &PgPool,
     tenant_id: Uuid,
@@ -209,26 +210,18 @@ pub async fn expand_nhop(
     max_depth: u32,
     rel_types: Option<&[&str]>,
     max_results: i64,
+    config_max_depth: Option<u32>,
 ) -> Result<Vec<(Uuid, u32)>, GraphError> {
-    let depth = max_depth.clamp(1, 5);
+    let ceiling = config_max_depth.unwrap_or(5);
+    let depth = max_depth.clamp(1, ceiling);
 
-    // Build rel_type filter clause
-    let rel_filter = if let Some(types) = rel_types {
-        if types.is_empty() {
-            String::new()
-        } else {
-            let quoted: Vec<String> = types
-                .iter()
-                .map(|t| format!("'{}'", t.replace('\'', "")))
-                .collect();
-            format!(" AND rel_type IN ({})", quoted.join(","))
-        }
-    } else {
-        String::new()
-    };
+    // Parameterized rel_type filter: use $5::text[] IS NULL OR rel_type = ANY($5)
+    let rel_type_vec: Option<Vec<String>> = rel_types
+        .filter(|t| !t.is_empty())
+        .map(|types| types.iter().map(|t| t.to_string()).collect());
 
-    // Use recursive CTE for variable-depth traversal
-    let query = format!(
+    // Use recursive CTE for variable-depth traversal with parameterized queries only
+    let rows = sqlx::query_as::<_, (Uuid, i32)>(
         r#"
         WITH RECURSIVE graph_walk(eid, depth) AS (
             -- Seed: direct neighbors (hop 1)
@@ -240,7 +233,7 @@ pub async fn expand_nhop(
               AND (source_entity_id = $2 OR target_entity_id = $2)
               AND status = 'active'
               AND (valid_to IS NULL OR valid_to > now())
-              {rel_filter}
+              AND ($5::text[] IS NULL OR rel_type = ANY($5))
 
             UNION
 
@@ -254,7 +247,7 @@ pub async fn expand_nhop(
               AND e.status = 'active'
               AND (e.valid_to IS NULL OR e.valid_to > now())
               AND gw.depth < $3
-              {rel_filter}
+              AND ($5::text[] IS NULL OR e.rel_type = ANY($5))
         )
         SELECT DISTINCT eid, MIN(depth) as depth
         FROM graph_walk
@@ -263,17 +256,15 @@ pub async fn expand_nhop(
         ORDER BY depth, eid
         LIMIT $4
         "#,
-        rel_filter = rel_filter
-    );
-
-    let rows = sqlx::query_as::<_, (Uuid, i32)>(&query)
-        .bind(tenant_id)
-        .bind(entity_id)
-        .bind(depth as i32)
-        .bind(max_results)
-        .fetch_all(pool)
-        .await
-        .map_err(GraphError::Database)?;
+    )
+    .bind(tenant_id)
+    .bind(entity_id)
+    .bind(depth as i32)
+    .bind(max_results)
+    .bind(&rel_type_vec)
+    .fetch_all(pool)
+    .await
+    .map_err(GraphError::Database)?;
 
     let result: Vec<(Uuid, u32)> = rows.into_iter().map(|(id, d)| (id, d as u32)).collect();
     debug!(
@@ -287,14 +278,17 @@ pub async fn expand_nhop(
 
 /// Find shortest path between two entities.
 /// Returns the path as a list of entity IDs (including start and end).
+/// `config_max_depth` — Configurable ceiling for depth (default 10 if None).
 pub async fn find_path(
     pool: &PgPool,
     tenant_id: Uuid,
     start_entity_id: Uuid,
     end_entity_id: Uuid,
     max_depth: u32,
+    config_max_depth: Option<u32>,
 ) -> Result<Option<Vec<Uuid>>, GraphError> {
-    let depth = max_depth.clamp(1, 10);
+    let ceiling = config_max_depth.unwrap_or(10);
+    let depth = max_depth.clamp(1, ceiling);
 
     let rows = sqlx::query_as::<_, (Vec<Uuid>,)>(
         r#"
@@ -461,13 +455,19 @@ pub async fn search_entities_by_name(
     query: &str,
     limit: i64,
 ) -> Result<Vec<EntityRow>, GraphError> {
-    let pattern = format!("%{}%", query.to_lowercase());
+    // Escape SQL LIKE wildcards to prevent entity enumeration attacks
+    let escaped = query
+        .to_lowercase()
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%{}%", escaped);
     let rows = sqlx::query_as::<_, EntityRow>(
         r#"
         SELECT * FROM entities
         WHERE tenant_id = $1
           AND status = 'active'
-          AND LOWER(name) LIKE $2
+          AND LOWER(name) LIKE $2 ESCAPE '\'
         ORDER BY updated_at DESC
         LIMIT $3
         "#,

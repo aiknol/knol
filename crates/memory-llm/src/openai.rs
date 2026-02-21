@@ -56,8 +56,13 @@ impl OpenAiProvider {
 
     /// Create with a custom endpoint (for Azure, Ollama, etc.).
     pub fn with_url(api_key: String, model: String, api_url: String) -> Self {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
-            client: Arc::new(Client::new()),
+            client: Arc::new(client),
             api_key: Secret::new(api_key),
             model,
             api_url,
@@ -132,7 +137,15 @@ impl OpenAiProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(LlmError::Api(format!("OpenAI HTTP {}: {}", status, body)));
+            let truncated = if body.len() > 200 {
+                &body[..200]
+            } else {
+                &body
+            };
+            return Err(LlmError::Api(format!(
+                "OpenAI HTTP {}: {}",
+                status, truncated
+            )));
         }
 
         let api_response: OpenAiResponse = response.json().await.map_err(LlmError::Request)?;
@@ -279,9 +292,14 @@ impl LlmProvider for OpenAiProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            let truncated = if body.len() > 200 {
+                &body[..200]
+            } else {
+                &body
+            };
             return Err(LlmError::Api(format!(
                 "OpenAI verification HTTP {}: {}",
-                status, body
+                status, truncated
             )));
         }
 

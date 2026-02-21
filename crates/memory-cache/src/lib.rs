@@ -5,6 +5,24 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::time::Duration;
 use tracing::{debug, warn};
 
+/// Redact password from a connection URL for safe logging.
+/// Replaces `://user:password@` with `://user:***@`.
+fn redact_url_password(url: &str) -> String {
+    // Find "://" then look for ":" after username and "@" for host start
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = &url[scheme_end + 3..];
+        if let Some(at_pos) = after_scheme.find('@') {
+            let userinfo = &after_scheme[..at_pos];
+            if let Some(colon_pos) = userinfo.find(':') {
+                let user = &userinfo[..colon_pos];
+                let host_part = &after_scheme[at_pos..];
+                return format!("{}://{}:***{}", &url[..scheme_end], user, host_part);
+            }
+        }
+    }
+    url.to_string()
+}
+
 fn install_rustls_provider_if_needed() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         // If another crate installed a provider first, install_default returns Err.
@@ -19,7 +37,10 @@ pub async fn create_client(redis_url: &str) -> Result<RedisClient, fred::error::
     let config = RedisConfig::from_url(redis_url)?;
     let client = Builder::from_config(config).build()?;
     client.init().await?;
-    tracing::info!("Redis client connected to {}", redis_url);
+    // Redact password from URL before logging to prevent credential leakage.
+    // Pattern: scheme://user:PASSWORD@host → scheme://user:***@host
+    let safe_url = redact_url_password(redis_url);
+    tracing::info!("Redis client connected to {}", safe_url);
     Ok(client)
 }
 
@@ -99,11 +120,14 @@ pub async fn check_rate_limit(
     Ok(true)
 }
 
-/// Sliding-window rate limiter using a Redis Lua script (atomic).
+/// Sliding-window rate limiter using Redis sorted sets + atomic Lua script.
 ///
-/// Uses a sorted set where each entry is a timestamp. Old entries outside
-/// the window are pruned on each request. This prevents the burst-at-boundary
-/// problem of fixed-window rate limiters.
+/// Uses a sorted set where each entry is a timestamped member. Old entries
+/// outside the window are pruned on each request. This prevents the
+/// burst-at-boundary problem of fixed-window rate limiters.
+///
+/// All operations (prune, count, add, expire) are executed atomically in a
+/// single Lua script to prevent TOCTOU races under concurrent requests.
 ///
 /// Returns true if the request is allowed, false if rate limited.
 pub async fn check_rate_limit_sliding(
@@ -112,9 +136,62 @@ pub async fn check_rate_limit_sliding(
     max_requests: u64,
     window_secs: u64,
 ) -> Result<bool, CacheError> {
-    // fred is currently built without Lua interfaces in this workspace.
-    // Use fixed-window rate limiting as a safe fallback to preserve behavior.
-    check_rate_limit(client, key, max_requests, window_secs).await
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as f64;
+    let window_ms = (window_secs as f64) * 1000.0;
+    let window_start = now_ms - window_ms;
+
+    // Atomic Lua script: prune → count → conditionally add → set TTL
+    // Returns 1 if allowed, 0 if rate-limited.
+    let lua = r#"
+        local key = KEYS[1]
+        local window_start = tonumber(ARGV[1])
+        local max_req = tonumber(ARGV[2])
+        local now_ms = ARGV[3]
+        local member = ARGV[4]
+        local ttl = tonumber(ARGV[5])
+
+        redis.call('ZREMRANGEBYSCORE', key, '-inf', window_start)
+        local count = redis.call('ZCARD', key)
+
+        if count >= max_req then
+            return 0
+        end
+
+        redis.call('ZADD', key, now_ms, member)
+        redis.call('EXPIRE', key, ttl)
+        return 1
+    "#;
+
+    let member = format!("{}:{}", now_ms, rand::random::<u32>());
+    let ttl = (window_secs + 1) as i64;
+
+    let result: i64 = client
+        .eval(
+            lua,
+            vec![key.to_string()],
+            vec![
+                window_start.to_string(),
+                max_requests.to_string(),
+                now_ms.to_string(),
+                member,
+                ttl.to_string(),
+            ],
+        )
+        .await
+        .map_err(CacheError::Redis)?;
+
+    if result == 0 {
+        warn!(
+            "Rate limit exceeded for key: {} (max={})",
+            key, max_requests
+        );
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 #[derive(Debug, thiserror::Error)]

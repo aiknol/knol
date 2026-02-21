@@ -167,6 +167,67 @@ pub fn compute_signature(payload: &[u8], secret: &str) -> String {
     hex::encode(result.into_bytes())
 }
 
+/// Check whether an IP address is private/internal.
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || (v4.octets()[0] == 169 && v4.octets()[1] == 254) // link-local
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64) // CGN 100.64/10
+        }
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+    }
+}
+
+/// Check whether a URL resolves to a private/internal IP address.
+/// Protects against SSRF by resolving DNS and checking all resolved addresses.
+/// Re-validates at delivery time to prevent DNS rebinding attacks.
+fn is_private_url(url: &str) -> bool {
+    let parsed = match url::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return true, // invalid URL = treat as private
+    };
+    let host = match parsed.host_str() {
+        Some(h) => h,
+        None => return true,
+    };
+    // Block known internal hostnames
+    if host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host == "0.0.0.0"
+        || host == "169.254.169.254"
+        || host.ends_with(".internal")
+        || host.ends_with(".local")
+    {
+        return true;
+    }
+    // Check if host is a literal IP
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return is_private_ip(ip);
+    }
+    // Resolve DNS and check ALL resolved addresses.
+    // This prevents attackers from registering a hostname that resolves to
+    // an internal IP (e.g., attacker.com → 127.0.0.1).
+    let port = parsed.port().unwrap_or(443);
+    match std::net::ToSocketAddrs::to_socket_addrs(&(host, port)) {
+        Ok(addrs) => {
+            for addr in addrs {
+                if is_private_ip(addr.ip()) {
+                    return true;
+                }
+            }
+            false
+        }
+        // DNS resolution failure — treat as blocked to be safe
+        Err(_) => true,
+    }
+}
+
 /// Deliver a webhook event to a registered endpoint.
 /// Returns delivery result.
 pub async fn deliver_webhook(
@@ -175,6 +236,20 @@ pub async fn deliver_webhook(
     event: &WebhookEvent,
     config: &WebhookConfig,
 ) -> WebhookDelivery {
+    // Re-validate URL at delivery time to prevent DNS rebinding attacks.
+    // The URL was validated at registration time, but DNS may have changed.
+    if is_private_url(&registration.url) {
+        return WebhookDelivery {
+            webhook_id: registration.id,
+            event_id: event.id,
+            status_code: None,
+            success: false,
+            attempt: 0,
+            error: Some("Webhook URL resolves to a private/internal address".into()),
+            delivered_at: Utc::now(),
+        };
+    }
+
     let payload = match serde_json::to_vec(event) {
         Ok(p) => p,
         Err(e) => {
@@ -216,19 +291,25 @@ pub async fn deliver_webhook(
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let success = resp.status().is_success();
-                return WebhookDelivery {
-                    webhook_id: registration.id,
-                    event_id: event.id,
-                    status_code: Some(status),
-                    success,
-                    attempt,
-                    error: if success {
-                        None
-                    } else {
-                        Some(format!("HTTP {}", status))
-                    },
-                    delivered_at: Utc::now(),
-                };
+                if success || resp.status().is_client_error() {
+                    // 2xx: success — return immediately.
+                    // 4xx: client error — retrying won't help, return immediately.
+                    return WebhookDelivery {
+                        webhook_id: registration.id,
+                        event_id: event.id,
+                        status_code: Some(status),
+                        success,
+                        attempt,
+                        error: if success {
+                            None
+                        } else {
+                            Some(format!("HTTP {}", status))
+                        },
+                        delivered_at: Utc::now(),
+                    };
+                }
+                // 5xx: server error — treat as retryable (same as network error).
+                last_error = Some(format!("HTTP {}", status));
             }
             Err(e) => {
                 last_error = Some(e.to_string());

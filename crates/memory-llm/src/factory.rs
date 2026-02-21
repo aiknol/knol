@@ -16,12 +16,23 @@ use crate::provider::LlmProvider;
 use crate::types::LlmProviderKind;
 
 /// Configuration resolved from DB + env for building a provider.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LlmConfig {
     pub provider: LlmProviderKind,
     pub api_key: String,
     pub model: String,
     pub api_url: Option<String>,
+}
+
+impl std::fmt::Debug for LlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmConfig")
+            .field("provider", &self.provider)
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("api_url", &self.api_url)
+            .finish()
+    }
 }
 
 /// Build an [`LlmProvider`] from explicit config.

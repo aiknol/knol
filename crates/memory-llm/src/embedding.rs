@@ -13,11 +13,13 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 /// Configuration for the embedding provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
     /// Provider: "openai", "voyage", "gemini", "local"
     pub provider: String,
     /// API key for the embedding provider.
+    /// Excluded from Debug and serialization to prevent accidental exposure.
+    #[serde(skip_serializing)]
     pub api_key: String,
     /// Model name (e.g., "text-embedding-3-small", "voyage-3", "text-embedding-004").
     pub model: String,
@@ -29,6 +31,20 @@ pub struct EmbeddingConfig {
     pub cache_enabled: bool,
     /// Max cache entries (LRU eviction).
     pub cache_max_entries: usize,
+}
+
+impl std::fmt::Debug for EmbeddingConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingConfig")
+            .field("provider", &self.provider)
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("dimensions", &self.dimensions)
+            .field("api_url", &self.api_url)
+            .field("cache_enabled", &self.cache_enabled)
+            .field("cache_max_entries", &self.cache_max_entries)
+            .finish()
+    }
 }
 
 impl Default for EmbeddingConfig {
@@ -103,9 +119,14 @@ impl EmbeddingProvider {
         } else {
             0
         };
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             config,
-            http_client: reqwest::Client::new(),
+            http_client,
             cache: Arc::new(RwLock::new(LruCache::new(cache_max))),
         }
     }
@@ -118,7 +139,7 @@ impl EmbeddingProvider {
             db_config::load_string(pool, "embedding.provider", "EMBEDDING_PROVIDER", "openai")
                 .await;
         let api_key =
-            db_config::load_string(pool, "embedding.api_key", "EMBEDDING_API_KEY", "").await;
+            db_config::load_secret(pool, "embedding.api_key", "EMBEDDING_API_KEY", "").await;
         let model = db_config::load_string(
             pool,
             "embedding.model",
@@ -149,11 +170,11 @@ impl EmbeddingProvider {
             let llm_provider =
                 db_config::load_string(pool, "llm.provider", "LLM_PROVIDER", "gemini").await;
             match llm_provider.to_lowercase().as_str() {
-                "openai" => db_config::load_string(pool, "llm.api_key", "OPENAI_API_KEY", "").await,
+                "openai" => db_config::load_secret(pool, "llm.api_key", "OPENAI_API_KEY", "").await,
                 "gemini" | "google" => {
-                    db_config::load_string(pool, "llm.api_key", "GEMINI_API_KEY", "").await
+                    db_config::load_secret(pool, "llm.api_key", "GEMINI_API_KEY", "").await
                 }
-                _ => db_config::load_string(pool, "llm.api_key", "ANTHROPIC_API_KEY", "").await,
+                _ => db_config::load_secret(pool, "llm.api_key", "ANTHROPIC_API_KEY", "").await,
             }
         } else {
             api_key
@@ -369,8 +390,8 @@ impl EmbeddingProvider {
             .collect();
 
         let url = format!(
-            "{}/models/{}:batchEmbedContents?key={}",
-            base_url, self.config.model, self.config.api_key
+            "{}/models/{}:batchEmbedContents",
+            base_url, self.config.model
         );
 
         let body = serde_json::json!({ "requests": requests });
@@ -379,6 +400,7 @@ impl EmbeddingProvider {
             .http_client
             .post(&url)
             .header("Content-Type", "application/json")
+            .header("x-goog-api-key", &self.config.api_key)
             .json(&body)
             .send()
             .await

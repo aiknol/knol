@@ -21,7 +21,6 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON tenant_api_keys(tenant_id);
 
 -- RLS: tenant_api_keys
 ALTER TABLE tenant_api_keys ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS tenant_isolation_api_keys ON tenant_api_keys;
 CREATE POLICY tenant_isolation_api_keys ON tenant_api_keys
   USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
 

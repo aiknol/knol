@@ -7,6 +7,12 @@ import httpx
 
 from memory_sdk import MemoryClient, AsyncMemoryClient
 
+# Test UUIDs for path parameter validation
+_MEM_ID = "00000000-0000-4000-8000-000000000001"
+_ENT_ID = "00000000-0000-4000-8000-000000000002"
+_ENT_ID2 = "00000000-0000-4000-8000-000000000003"
+_WH_ID = "00000000-0000-4000-8000-000000000004"
+
 
 class TestMemoryClientInit:
     """Test MemoryClient initialization."""
@@ -218,10 +224,10 @@ class TestMemoryClientGraphOperations:
             client = MemoryClient(api_key="test-key")
             client._client = mock_client
 
-            result = client.traverse_entity("entity-123", depth=4, limit=100)
+            result = client.traverse_entity(_ENT_ID, depth=4, limit=100)
 
             call_args = mock_client.get.call_args
-            assert call_args[0][0] == "/v1/graph/entities/entity-123/traverse"
+            assert call_args[0][0] == f"/v1/graph/entities/{_ENT_ID}/traverse"
             assert call_args[1]["params"]["depth"] == 4
             assert call_args[1]["params"]["limit"] == 100
 
@@ -237,10 +243,10 @@ class TestMemoryClientGraphOperations:
             client = MemoryClient(api_key="test-key")
             client._client = mock_client
 
-            result = client.find_path("entity-1", "entity-2", max_depth=6)
+            result = client.find_path(_ENT_ID, _ENT_ID2, max_depth=6)
 
             call_args = mock_client.get.call_args
-            assert call_args[0][0] == "/v1/graph/path/entity-1/entity-2"
+            assert call_args[0][0] == f"/v1/graph/path/{_ENT_ID}/{_ENT_ID2}"
             assert call_args[1]["params"]["max_depth"] == 6
 
     def test_get_entity_neighbors(self):
@@ -255,10 +261,10 @@ class TestMemoryClientGraphOperations:
             client = MemoryClient(api_key="test-key")
             client._client = mock_client
 
-            result = client.get_entity_neighbors("entity-123", rel_type="knows", limit=30)
+            result = client.get_entity_neighbors(_ENT_ID, rel_type="knows", limit=30)
 
             call_args = mock_client.get.call_args
-            assert call_args[0][0] == "/v1/graph/entities/entity-123/neighbors"
+            assert call_args[0][0] == f"/v1/graph/entities/{_ENT_ID}/neighbors"
             assert call_args[1]["params"]["rel_type"] == "knows"
             assert call_args[1]["params"]["limit"] == 30
 
@@ -327,9 +333,9 @@ class TestMemoryClientWebhooks:
             client = MemoryClient(api_key="test-key")
             client._client = mock_client
 
-            client.delete_webhook("wh-123")
+            client.delete_webhook(_WH_ID)
 
-            mock_client.delete.assert_called_once_with("/v1/webhooks/wh-123")
+            mock_client.delete.assert_called_once_with(f"/v1/webhooks/{_WH_ID}")
 
 
 class TestMemoryClientMemoryOperations:
@@ -410,7 +416,7 @@ class TestMemoryClientErrorHandling:
             client._client = mock_client
 
             with pytest.raises(httpx.HTTPStatusError):
-                client.get("nonexistent-id")
+                client.get(_MEM_ID)
 
     def test_delete_raises_on_error(self):
         """Test that delete raises error on non-2xx status."""
@@ -429,7 +435,7 @@ class TestMemoryClientErrorHandling:
             client._client = mock_client
 
             with pytest.raises(httpx.HTTPStatusError):
-                client.delete("memory-id")
+                client.delete(_MEM_ID)
 
 
 class TestAsyncMemoryClientInit:
@@ -500,10 +506,10 @@ class TestAsyncMemoryClientGraphOperations:
             client = AsyncMemoryClient(api_key="test-key")
             client._client = mock_client
 
-            result = await client.traverse_entity("entity-123", depth=5, limit=75)
+            result = await client.traverse_entity(_ENT_ID, depth=5, limit=75)
 
             call_args = mock_client.get.call_args
-            assert call_args[0][0] == "/v1/graph/entities/entity-123/traverse"
+            assert call_args[0][0] == f"/v1/graph/entities/{_ENT_ID}/traverse"
             assert call_args[1]["params"]["depth"] == 5
             assert call_args[1]["params"]["limit"] == 75
 
@@ -550,6 +556,243 @@ class TestAsyncMemoryClientWebhooks:
             client = AsyncMemoryClient(api_key="test-key")
             client._client = mock_client
 
-            await client.delete_webhook("wh-456")
+            await client.delete_webhook(_WH_ID)
 
-            mock_client.delete.assert_called_once_with("/v1/webhooks/wh-456")
+            mock_client.delete.assert_called_once_with(f"/v1/webhooks/{_WH_ID}")
+
+
+class TestMemoryClientGetAndUpdate:
+    """Test MemoryClient.get() and .update() methods."""
+
+    def test_get_memory(self):
+        """Test get method."""
+        with patch("httpx.Client") as mock_httpx:
+            mock_response = MagicMock()
+            mock_response.json.return_value = {"id": _MEM_ID, "content": "Test"}
+            mock_client = MagicMock()
+            mock_client.get.return_value = mock_response
+            mock_httpx.return_value = mock_client
+
+            client = MemoryClient(api_key="test-key")
+            client._client = mock_client
+
+            result = client.get(_MEM_ID)
+
+            mock_client.get.assert_called_once_with(f"/v1/memory/{_MEM_ID}")
+            assert result["id"] == _MEM_ID
+
+    def test_update_memory(self):
+        """Test update method with all fields."""
+        with patch("httpx.Client") as mock_httpx:
+            mock_response = MagicMock()
+            mock_response.json.return_value = {"id": _MEM_ID, "status": "updated"}
+            mock_client = MagicMock()
+            mock_client.put.return_value = mock_response
+            mock_httpx.return_value = mock_client
+
+            client = MemoryClient(api_key="test-key")
+            client._client = mock_client
+
+            result = client.update(_MEM_ID, content="Updated", importance=0.9)
+
+            call_args = mock_client.put.call_args
+            assert call_args[0][0] == f"/v1/memory/{_MEM_ID}"
+            payload = call_args[1]["json"]
+            assert payload["content"] == "Updated"
+            assert payload["importance"] == 0.9
+
+
+class TestMemoryClientRestore:
+    """Test MemoryClient.restore() and delete(permanent=True)."""
+
+    def test_restore(self):
+        """Test restore method."""
+        with patch("httpx.Client") as mock_httpx:
+            mock_response = MagicMock()
+            mock_response.json.return_value = {"id": _MEM_ID, "status": "restored"}
+            mock_client = MagicMock()
+            mock_client.post.return_value = mock_response
+            mock_httpx.return_value = mock_client
+
+            client = MemoryClient(api_key="test-key")
+            client._client = mock_client
+
+            result = client.restore(_MEM_ID)
+
+            mock_client.post.assert_called_once_with(f"/v1/memory/{_MEM_ID}/restore")
+            assert result["status"] == "restored"
+
+    def test_delete_soft(self):
+        """Test soft delete (default)."""
+        with patch("httpx.Client") as mock_httpx:
+            mock_response = MagicMock()
+            mock_client = MagicMock()
+            mock_client.delete.return_value = mock_response
+            mock_httpx.return_value = mock_client
+
+            client = MemoryClient(api_key="test-key")
+            client._client = mock_client
+
+            client.delete(_MEM_ID)
+
+            call_args = mock_client.delete.call_args
+            assert call_args[0][0] == f"/v1/memory/{_MEM_ID}"
+            assert call_args[1]["params"] == {}
+
+    def test_delete_permanent(self):
+        """Test permanent delete."""
+        with patch("httpx.Client") as mock_httpx:
+            mock_response = MagicMock()
+            mock_client = MagicMock()
+            mock_client.delete.return_value = mock_response
+            mock_httpx.return_value = mock_client
+
+            client = MemoryClient(api_key="test-key")
+            client._client = mock_client
+
+            client.delete(_MEM_ID, permanent=True)
+
+            call_args = mock_client.delete.call_args
+            assert call_args[0][0] == f"/v1/memory/{_MEM_ID}"
+            assert call_args[1]["params"] == {"permanent": "true"}
+
+
+class TestMemoryClientAdminOps:
+    """Test MemoryClient admin operations."""
+
+    def test_get_usage(self):
+        """Test get_usage method."""
+        with patch("httpx.Client") as mock_httpx:
+            mock_response = MagicMock()
+            mock_response.json.return_value = {"plan": "pro", "usage_ops_month": 42}
+            mock_client = MagicMock()
+            mock_client.get.return_value = mock_response
+            mock_httpx.return_value = mock_client
+
+            client = MemoryClient(api_key="test-key")
+            client._client = mock_client
+
+            result = client.get_usage()
+
+            mock_client.get.assert_called_once_with("/v1/admin/tenants")
+            assert result["plan"] == "pro"
+
+    def test_list_audit_log(self):
+        """Test list_audit_log method with filter."""
+        with patch("httpx.Client") as mock_httpx:
+            mock_response = MagicMock()
+            mock_response.json.return_value = [{"action": "create"}]
+            mock_client = MagicMock()
+            mock_client.get.return_value = mock_response
+            mock_httpx.return_value = mock_client
+
+            client = MemoryClient(api_key="test-key")
+            client._client = mock_client
+
+            result = client.list_audit_log(memory_id="mem-1", limit=20)
+
+            call_args = mock_client.get.call_args
+            assert call_args[0][0] == "/v1/admin/audit"
+            assert call_args[1]["params"]["memory_id"] == "mem-1"
+            assert call_args[1]["params"]["limit"] == 20
+
+
+class TestMemoryClientGraphExtended:
+    """Test extended graph operations."""
+
+    def test_list_entities(self):
+        """Test list_entities method."""
+        with patch("httpx.Client") as mock_httpx:
+            mock_response = MagicMock()
+            mock_response.json.return_value = [{"id": "e1", "name": "Test"}]
+            mock_client = MagicMock()
+            mock_client.get.return_value = mock_response
+            mock_httpx.return_value = mock_client
+
+            client = MemoryClient(api_key="test-key")
+            client._client = mock_client
+
+            result = client.list_entities(entity_type="person", limit=25)
+
+            call_args = mock_client.get.call_args
+            assert call_args[0][0] == "/v1/graph/entities"
+            assert call_args[1]["params"]["entity_type"] == "person"
+            assert call_args[1]["params"]["limit"] == 25
+
+    def test_get_entity(self):
+        """Test get_entity method."""
+        with patch("httpx.Client") as mock_httpx:
+            mock_response = MagicMock()
+            mock_response.json.return_value = {"id": _ENT_ID, "name": "Test"}
+            mock_client = MagicMock()
+            mock_client.get.return_value = mock_response
+            mock_httpx.return_value = mock_client
+
+            client = MemoryClient(api_key="test-key")
+            client._client = mock_client
+
+            result = client.get_entity(_ENT_ID)
+
+            mock_client.get.assert_called_once_with(f"/v1/graph/entities/{_ENT_ID}")
+
+    def test_get_entity_edges(self):
+        """Test get_entity_edges method."""
+        with patch("httpx.Client") as mock_httpx:
+            mock_response = MagicMock()
+            mock_response.json.return_value = {"outgoing": [], "incoming": []}
+            mock_client = MagicMock()
+            mock_client.get.return_value = mock_response
+            mock_httpx.return_value = mock_client
+
+            client = MemoryClient(api_key="test-key")
+            client._client = mock_client
+
+            result = client.get_entity_edges(_ENT_ID)
+
+            mock_client.get.assert_called_once_with(f"/v1/graph/entities/{_ENT_ID}/edges")
+
+    def test_expand_entity(self):
+        """Test expand_entity method."""
+        with patch("httpx.Client") as mock_httpx:
+            mock_response = MagicMock()
+            mock_response.json.return_value = {"entity_ids": [_ENT_ID2]}
+            mock_client = MagicMock()
+            mock_client.get.return_value = mock_response
+            mock_httpx.return_value = mock_client
+
+            client = MemoryClient(api_key="test-key")
+            client._client = mock_client
+
+            result = client.expand_entity(_ENT_ID)
+
+            mock_client.get.assert_called_once_with(f"/v1/graph/entities/{_ENT_ID}/expand")
+
+
+class TestMemoryClientNetworkErrors:
+    """Test MemoryClient network error handling."""
+
+    def test_connect_error(self):
+        """Test that ConnectError is raised on connection failure."""
+        with patch("httpx.Client") as mock_httpx:
+            mock_client = MagicMock()
+            mock_client.post.side_effect = httpx.ConnectError("Connection refused")
+            mock_httpx.return_value = mock_client
+
+            client = MemoryClient(api_key="test-key")
+            client._client = mock_client
+
+            with pytest.raises(httpx.ConnectError):
+                client.add("test content")
+
+    def test_timeout_error(self):
+        """Test that timeout errors propagate."""
+        with patch("httpx.Client") as mock_httpx:
+            mock_client = MagicMock()
+            mock_client.post.side_effect = httpx.TimeoutException("Request timed out")
+            mock_httpx.return_value = mock_client
+
+            client = MemoryClient(api_key="test-key")
+            client._client = mock_client
+
+            with pytest.raises(httpx.TimeoutException):
+                client.search("test query")
