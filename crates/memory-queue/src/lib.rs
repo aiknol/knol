@@ -25,11 +25,50 @@ fn redact_url_password(url: &str) -> String {
     url.to_string()
 }
 
+/// Parse optional userinfo (user:password) from a NATS URL.
+/// Returns (clean_url_without_userinfo, Option<(user, password)>).
+fn parse_nats_credentials(url: &str) -> (String, Option<(String, String)>) {
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = &url[scheme_end + 3..];
+        if let Some(at_pos) = after_scheme.find('@') {
+            let userinfo = &after_scheme[..at_pos];
+            let host_part = &after_scheme[at_pos + 1..];
+            let clean_url = format!("{}://{}", &url[..scheme_end], host_part);
+            if let Some(colon_pos) = userinfo.find(':') {
+                let user = userinfo[..colon_pos].to_string();
+                let pass = userinfo[colon_pos + 1..].to_string();
+                return (clean_url, Some((user, pass)));
+            }
+        }
+    }
+    (url.to_string(), None)
+}
+
 /// Connect to NATS and return a JetStream context.
+/// Supports credentials via:
+///   1. Embedded in URL: `nats://user:pass@host:port`
+///   2. Environment variables: `NATS_USER` and `NATS_PASSWORD`
 pub async fn connect(nats_url: &str) -> Result<(async_nats::Client, Context), QueueError> {
-    let client = async_nats::connect(nats_url)
-        .await
-        .map_err(QueueError::Connect)?;
+    let (clean_url, url_creds) = parse_nats_credentials(nats_url);
+
+    // Prefer credentials from URL, fall back to env vars.
+    let creds = url_creds.or_else(|| {
+        let user = std::env::var("NATS_USER").ok()?;
+        let pass = std::env::var("NATS_PASSWORD").ok()?;
+        Some((user, pass))
+    });
+
+    let client = if let Some((user, pass)) = creds {
+        async_nats::ConnectOptions::with_user_and_password(user, pass)
+            .connect(&clean_url)
+            .await
+            .map_err(QueueError::Connect)?
+    } else {
+        async_nats::connect(&clean_url)
+            .await
+            .map_err(QueueError::Connect)?
+    };
+
     let jetstream = jetstream::new(client.clone());
     // Redact password from URL before logging to prevent credential leakage.
     let safe_url = redact_url_password(nats_url);
