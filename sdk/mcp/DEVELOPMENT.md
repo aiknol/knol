@@ -55,7 +55,7 @@ This will watch for changes in `src/` and recompile TypeScript files automatical
 
 ```bash
 export KNOL_API_KEY="test-key-12345"
-export KNOL_API_URL="http://localhost:8080"
+export KNOL_API_URL="http://localhost:3000"
 export KNOL_USER_ID="test-user"
 ```
 
@@ -233,7 +233,7 @@ Use curl to test the Knol API directly:
 
 ```bash
 curl -H "Authorization: Bearer YOUR_KEY" \
-  http://localhost:8080/v1/memory/search \
+  http://localhost:3000/v1/memory/search \
   -d '{"query":"test","user_id":"user1","limit":5}' \
   -H "Content-Type: application/json"
 ```
@@ -277,7 +277,7 @@ The server respects these environment variables:
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `KNOL_API_KEY` | Bearer token for API auth | Required |
-| `KNOL_API_URL` | Knol API base URL | http://localhost:8080 |
+| `KNOL_API_URL` | Knol API base URL | http://localhost:3000 |
 | `KNOL_USER_ID` | Default user for operations | default |
 
 Set them before running the server or in the MCP client configuration.

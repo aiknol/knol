@@ -118,7 +118,7 @@ Done! The AI now has persistent memory.
 | Variable | Required | Default | Purpose |
 |----------|----------|---------|---------|
 | `KNOL_API_KEY` | ✓ | - | Bearer token for API |
-| `KNOL_API_URL` | ✗ | `http://localhost:8080` | API endpoint |
+| `KNOL_API_URL` | ✗ | `http://localhost:3000` | API endpoint |
 | `KNOL_USER_ID` | ✗ | `default` | Default user for operations |
 
 ### Example MCP Configuration

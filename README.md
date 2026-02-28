@@ -39,7 +39,7 @@ Knol is a set of microservices written in Rust, connected via NATS JetStream for
 ```
 ┌─────────────┐     ┌───────────────┐     ┌──────────────────┐
 │   Client     │────▶│   Gateway     │────▶│  Write Service   │
-│  (SDK/API)   │     │  (port 8080)  │     │   (port 8081)    │
+│  (SDK/API)   │     │  (port 3000)  │     │   (port 8081)    │
 └─────────────┘     │               │     │                  │
                     │  Auth, RBAC   │     │  Fast ACK +      │
                     │  Rate Limit   │     │  NATS publish     │
@@ -114,7 +114,7 @@ cargo run --bin service-gateway
 ### 4. Write your first memory
 
 ```bash
-curl -X POST http://localhost:8080/v1/memory \
+curl -X POST http://localhost:3000/v1/memory \
   -H "Authorization: Bearer $KNOL_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"content": "User prefers dark mode and uses VS Code", "role": "user"}'
@@ -123,7 +123,7 @@ curl -X POST http://localhost:8080/v1/memory \
 ### 5. Search memories
 
 ```bash
-curl -X POST http://localhost:8080/v1/memory/search \
+curl -X POST http://localhost:3000/v1/memory/search \
   -H "Authorization: Bearer $KNOL_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"query": "What editor does the user prefer?"}'
@@ -209,7 +209,7 @@ results = client.search("programming language preferences")
 
 | Service | Default Port | Role |
 |---------|-------------|------|
-| **Gateway** | 8080 | Auth, routing, rate limiting |
+| **Gateway** | 3000 | Auth, routing, rate limiting |
 | **Write** | 8081 | Memory ingestion, dedup, NATS publish |
 | **Retrieve** | 8082 | Hybrid search, graph traversal, scoring |
 | **Graph** | 8083 | LLM extraction, entity/edge upsert, webhooks |

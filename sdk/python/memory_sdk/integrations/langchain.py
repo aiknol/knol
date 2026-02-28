@@ -48,7 +48,7 @@ class KnolMemory(BaseMemory):
         from memory_sdk.client import MemoryClient
         from langchain.chat_models import ChatOpenAI
 
-        client = MemoryClient(api_key="key", base_url="http://localhost:8080")
+        client = MemoryClient(api_key="key", base_url="http://localhost:3000")
         memory = KnolMemory(
             client=client,
             user_id="user-123",
@@ -194,7 +194,7 @@ class KnolChatMessageHistory(BaseChatMessageHistory):
         from memory_sdk.client import MemoryClient
         from langchain.memory import ConversationBufferMemory
 
-        client = MemoryClient(api_key="key", base_url="http://localhost:8080")
+        client = MemoryClient(api_key="key", base_url="http://localhost:3000")
         history = KnolChatMessageHistory(
             client=client,
             user_id="user-123",
@@ -318,7 +318,7 @@ class KnolRetriever(BaseRetriever):
         from memory_sdk.integrations.langchain import KnolRetriever
         from memory_sdk.client import MemoryClient
 
-        client = MemoryClient(api_key="key", base_url="http://localhost:8080")
+        client = MemoryClient(api_key="key", base_url="http://localhost:3000")
         retriever = KnolRetriever(client=client, user_id="user-123")
 
         docs = retriever.get_relevant_documents("What are user preferences?")

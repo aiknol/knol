@@ -37,7 +37,7 @@ class KnolCrewMemory:
         from memory_sdk.client import MemoryClient
         from crewai import Agent
 
-        client = MemoryClient(api_key="key", base_url="http://localhost:8080")
+        client = MemoryClient(api_key="key", base_url="http://localhost:3000")
         memory = KnolCrewMemory(client=client, agent_id="agent-1")
 
         agent = Agent(
@@ -183,7 +183,7 @@ class KnolCrewStorage(Storage):
         from memory_sdk.client import MemoryClient
         from crewai import Crew
 
-        client = MemoryClient(api_key="key", base_url="http://localhost:8080")
+        client = MemoryClient(api_key="key", base_url="http://localhost:3000")
         storage = KnolCrewStorage(client=client, user_id="user-123")
 
         crew = Crew(agents=[agent1, agent2], tasks=[task1, task2])
