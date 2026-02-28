@@ -222,7 +222,7 @@ export KNOL_USER_ID="your-user-id"
       "args": ["/path/to/knol-mcp/dist/index.js"],
       "env": {
         "KNOL_API_KEY": "sk_dev_test_key",
-        "KNOL_API_URL": "http://localhost:8080",
+        "KNOL_API_URL": "http://localhost:3000",
         "KNOL_USER_ID": "dev-user"
       }
     }
@@ -281,7 +281,7 @@ services:
   knol-api:
     image: knol/api:latest
     ports:
-      - "8080:8080"
+      - "3000:8080"
     environment:
       - DATABASE_URL=postgresql://...
 
@@ -327,12 +327,12 @@ curl -H "Authorization: Bearer YOUR_KEY" \
 
 ### Connection Refused
 
-**Error**: `Failed to connect to localhost:8080`
+**Error**: `Failed to connect to localhost:3000`
 
 **Solution**:
 1. Verify Knol API server is running
 2. Check KNOL_API_URL is correct
-3. Test network connectivity: `curl http://localhost:8080/health`
+3. Test network connectivity: `curl http://localhost:3000/health`
 
 ### Tools Not Appearing
 
@@ -419,7 +419,7 @@ Then set `KNOL_API_KEY` and `KNOL_USER_ID` locally.
 Always test in development first:
 
 ```bash
-export KNOL_API_URL="http://localhost:8080"
+export KNOL_API_URL="http://localhost:3000"
 export KNOL_API_KEY="test-key"
 npm start
 ```

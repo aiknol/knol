@@ -37,7 +37,7 @@ The server reads configuration from environment variables:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `KNOL_API_KEY` | Yes | - | Bearer token for Knol API authentication |
-| `KNOL_API_URL` | No | `http://localhost:8080` | Knol API endpoint URL |
+| `KNOL_API_URL` | No | `http://localhost:3000` | Knol API endpoint URL |
 | `KNOL_USER_ID` | No | `default` | Default user ID for operations |
 
 ## MCP Tools
@@ -261,7 +261,7 @@ To test the server locally, set up environment variables and run:
 
 ```bash
 export KNOL_API_KEY="test-key"
-export KNOL_API_URL="http://localhost:8080"
+export KNOL_API_URL="http://localhost:3000"
 npm run build
 npm start
 ```

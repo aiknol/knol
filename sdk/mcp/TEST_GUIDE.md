@@ -89,7 +89,7 @@ Test if the server can reach the Knol API:
 
 ```bash
 KNOL_API_KEY="sk_test_actual_key" \
-KNOL_API_URL="http://localhost:8080" \
+KNOL_API_URL="http://localhost:3000" \
 KNOL_USER_ID="test-user" \
 npm start
 ```
@@ -116,7 +116,7 @@ Send:
 ```bash
 cat test-search.json | \
   KNOL_API_KEY="sk_test_actual_key" \
-  KNOL_API_URL="http://localhost:8080" \
+  KNOL_API_URL="http://localhost:3000" \
   npm start
 ```
 
@@ -389,7 +389,7 @@ Check response time and memory usage.
 ```bash
 for i in {1..100}; do
   echo "Request $i"
-  curl -X POST http://localhost:8080/v1/memory/search \
+  curl -X POST http://localhost:3000/v1/memory/search \
     -H "Authorization: Bearer YOUR_KEY" \
     -H "Content-Type: application/json" \
     -d '{"query":"test","limit":5}'
@@ -428,7 +428,7 @@ ab -n 100 -c 10 \
   -H "Authorization: Bearer YOUR_KEY" \
   -H "Content-Type: application/json" \
   -p request.json \
-  http://localhost:8080/v1/memory/search
+  http://localhost:3000/v1/memory/search
 ```
 
 ### Load Testing with Artillery
@@ -437,7 +437,7 @@ Create `load-test.yml`:
 
 ```yaml
 config:
-  target: "http://localhost:8080"
+  target: "http://localhost:3000"
   phases:
     - duration: 60
       arrivalRate: 10

@@ -15,7 +15,7 @@ class AsyncMemoryClient:
     """Async client for the Memory Infrastructure API.
 
     Usage:
-        async with AsyncMemoryClient(api_key="your-key", base_url="http://localhost:8080") as client:
+        async with AsyncMemoryClient(api_key="your-key", base_url="http://localhost:3000") as client:
             # Add a memory
             result = await client.add("The user prefers dark mode", user_id="user-123")
 
@@ -35,7 +35,7 @@ class AsyncMemoryClient:
     def __init__(
         self,
         api_key: str,
-        base_url: str = "http://localhost:8080",
+        base_url: str = "http://localhost:3000",
         timeout: float = 30.0,
     ):
         self._base_url = base_url.rstrip("/")

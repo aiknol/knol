@@ -10,7 +10,7 @@ import {
 } from "@modelcontextprotocol/sdk";
 
 // Configuration from environment
-const KNOL_API_URL = process.env.KNOL_API_URL || "http://localhost:8080";
+const KNOL_API_URL = process.env.KNOL_API_URL || "http://localhost:3000";
 const KNOL_API_KEY = process.env.KNOL_API_KEY;
 const KNOL_USER_ID = process.env.KNOL_USER_ID || "default";
 

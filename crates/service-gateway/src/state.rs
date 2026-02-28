@@ -114,7 +114,7 @@ impl AppState {
             &db_pool,
             "gateway.cors_origins",
             "GATEWAY_CORS_ORIGINS",
-            "http://localhost:3005,http://localhost:3006,http://localhost:8080",
+            "http://localhost:3005,http://localhost:3006,http://localhost:3000",
         )
         .await;
 

@@ -25,7 +25,7 @@ class MemoryClient:
     """Client for the Memory Infrastructure API.
 
     Usage:
-        client = MemoryClient(api_key="your-key", base_url="http://localhost:8080")
+        client = MemoryClient(api_key="your-key", base_url="http://localhost:3000")
 
         # Add a memory
         result = client.add("The user prefers dark mode", user_id="user-123")
@@ -46,7 +46,7 @@ class MemoryClient:
     def __init__(
         self,
         api_key: str,
-        base_url: str = "http://localhost:8080",
+        base_url: str = "http://localhost:3000",
         timeout: float = 30.0,
     ):
         self._base_url = base_url.rstrip("/")
